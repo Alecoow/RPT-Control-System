@@ -1,0 +1,789 @@
+// Main Control File on Machine
+// Version 1.1 4-28-2026
+// Changes made: Changed DCTS equations and limits to operate with 1/4th the power. Now allows sending of range data to controller. Allow for greater auto tension values from controller.
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+#include "HX711.h"
+#include "printf.h"
+
+//////////////////
+// Pin definitions
+
+// HX711 Pins
+#define DT_PIN 17   // HX711 DT pin connected to Arduino D2
+#define SCK_PIN 18  // HX711 SCK pin connected to Arduino D3
+
+// Traction Wheel Pins
+#define TractionWheel1_PWM 6
+#define TractionWheel2_PWM 5
+#define TractionWheel3_PWM 4
+#define TractionWheel1_DIR 23
+#define TractionWheel2_DIR 25
+#define TractionWheel3_DIR 27
+
+// Circumferential Motor Pins
+#define Winch_PWM 3
+#define Winch_DIR 29
+
+// Winch Motor Pins
+#define Circumferential_PWM 45
+#define Circumferential_DIR 31
+
+// Stepper Motor Pins
+#define Stepper_PWM 37  // These may be flipped
+#define Stepper_DIR 35  // They are named C1 and C2??
+
+// Chainsaw Pin
+#define Chainsaw_EN 39  // Toggle on/off high/low
+
+// Load Cell Definitions
+#define PLMI 5  // The Plus/minus value. The padding for the target weight.
+
+// Ultrasonic Sensor Pin Def
+#define Ultrasonic_ECHO 20
+#define Ultrasonic_TRIG 19
+
+// RF pins
+#define CE_PIN 49
+#define CSN_PIN 53
+
+//////////////////
+
+unsigned long lastReceivedTime = 0;
+const unsigned long connectionTimeout = 200;  // ms
+
+uint8_t Target_Weight = 30;  // Adjustable Target Weight global var
+
+// Ultrasonic sensor duration var
+unsigned long ultra_dur;
+unsigned long ultra_dis;
+
+// HX711 & load cell variables
+HX711 scale;               // ADC Init
+bool DCTS_EN = 0;          // Enable DCTS
+long reading = 0;          // Raw reading from load cell
+short int counter = 0;     // Counter to slow the rate of message speed
+uint8_t duty_percent = 0;  // Duty cycle percentage
+uint8_t temp_OCR3B = 0;    // OCR3B temporary variable
+uint8_t temp_OCR4B = 0;    // OCR4B temporary variable
+uint8_t temp_OCR5B = 0;    // OCR5B temporary variable
+
+// Convert weight in lbs to quanta
+long int TW_Adj = Target_Weight * (long)10430;
+long int PLMI_Adj = PLMI * (long)10430;
+
+// RF Variables
+
+/* Buttons 1-8
+  bool b_DCTS_ON;
+  bool b_DCTS_OFF;
+  bool b_SET_TENSION;
+  bool b_DISP_TENSION;
+  bool b_CHAIN_ON;
+  bool b_CHAIN_OFF;
+  bool b_CHAIN_DIST_SET;
+  bool b_CHAIN_DIST_DISP;
+*/
+
+// Define the same structure used in the transmitter
+struct ControllerPacket {
+  char buttonID;
+  bool b_EMERGENCY;
+  uint8_t winch_spd;
+  bool winch_dir;
+  uint8_t traction_spd;
+  bool traction_dir;
+  uint8_t circum_spd;
+  bool circum_dir;
+  uint8_t radial_spd;
+  bool radial_dir;
+  uint8_t tensionSet;
+};
+
+bool isValid(const ControllerPacket& p) {  // Verifies packet sends valid struct
+  // WIP
+  return true;
+}
+
+// Radio Initialization
+RF24 radio(CE_PIN, CSN_PIN);
+const byte address[5] = { 'T', 'E', 'S', 'T', '1' };  // Must match transmitter
+ControllerPacket rxPkt;
+ControllerPacket tempPkt;
+bool radioSent = 0;
+
+uint8_t ackArr[2];  // Send back tension and distance values
+
+// Dir Speed Dampening
+bool currDIR = 0;
+uint16_t dirCTR = 0;
+
+//RF Debug
+unsigned long startTimer;
+char testchar = '0';  // Debug // Serial.Read val (for controlling with just main control)
+
+void loadCellInit() {            // Initialize load cell scale
+  scale.begin(DT_PIN, SCK_PIN);  // Initialize HX711 with DT and SCK pins
+  scale.set_gain(32);
+  // Serial.println("Initializing HX711...");
+  delay(500);      // Allow some time for stabilization
+  scale.tare(20);  // Tare the scale
+  // Serial.print("Tare offset: ");
+  // Serial.println(scale.get_offset());  // Display the tare offset value
+}
+
+void loadCellDebug() {  // Used to read the load cell for debug purposes
+  //reading = scale.read();
+  // Serial.print("\n\nRaw Reading: ");
+  // Serial.println(reading);  // Display the digital reading as a decimal
+  // Serial.print("\n\nTarget Weight: ");
+  // Serial.println(TW_Adj);
+  // Serial.print("\nWeight (lbs): ");
+  // Serial.println(reading / 10430.0);  // Linear regression slope, every pound is about 10430 quanta, +-30
+  // Serial.print("\nWeight (kg): ");
+  // Serial.println(reading / 22998.0);
+  //manDelay(2000000);
+  //delay(100);
+}
+
+void pinInit() {  // Initialize every pin we will use according to Arduino Mega PCB schematic
+  pinMode(TractionWheel1_PWM, OUTPUT);
+  pinMode(TractionWheel2_PWM, OUTPUT);
+  pinMode(TractionWheel3_PWM, OUTPUT);
+  pinMode(TractionWheel1_DIR, OUTPUT);
+  pinMode(TractionWheel2_DIR, OUTPUT);
+  pinMode(TractionWheel3_DIR, OUTPUT);
+
+  pinMode(Winch_PWM, OUTPUT);
+  pinMode(Winch_DIR, OUTPUT);
+
+  pinMode(Circumferential_PWM, OUTPUT);
+  pinMode(Circumferential_DIR, OUTPUT);
+
+  pinMode(Stepper_PWM, OUTPUT);
+  pinMode(Stepper_DIR, OUTPUT);
+
+  pinMode(Chainsaw_EN, OUTPUT);
+
+  pinMode(Ultrasonic_TRIG, OUTPUT);
+  pinMode(Ultrasonic_ECHO, OUTPUT);
+  digitalWrite(Ultrasonic_TRIG, LOW);
+}
+
+void radioInit() {  // Intializes RF, this is used for both RX and TX
+  radio.begin();
+  radio.setDataRate(RF24_250KBPS);
+  radio.setPALevel(RF24_PA_LOW);
+  radio.setChannel(76);
+  radio.openReadingPipe(1, address);
+  radio.enableDynamicPayloads();
+  radio.enableAckPayload();
+  radio.setAutoAck(true);
+  radio.startListening();
+}
+
+void emergency() {  // Turn off all motors when emergency button is pressed and stay locked in it
+  // Serial.println("EMERGENCY PRESSED");
+  manualCircumControl(0, 0);
+  manualTractControl(0, 0);
+  manualTensionControl(0, 0);
+  manualRadialControl(0, 0);
+  while (1) {  // Stay locked in emergency until 7 and Emergency buttons are pressed
+    radioRX();
+    if (rxPkt.winch_spd > 100 && rxPkt.buttonID == '8') {  // If Emergency button and 7 are pressed at the same time, exit Emergency mode
+      // Serial.println("EMERGENCY AVERTED");
+      break;
+    }
+  }
+}
+
+void PWMTimerInit() {  // initializes the PWM for motor speed
+  // Timer mode
+  TCCR3A = 0;  // Clear all bits in control register A
+
+  // Clear all WGM and CS bits first
+  TCCR3B &= ~((1 << WGM33) | (1 << WGM32) | (1 << WGM31) | (1 << WGM30));
+  TCCR3B &= ~((1 << CS32) | (1 << CS31) | (1 << CS30));
+
+  // Set CTC mode (WGM32 = 1), Prescaler = 64 cs31 + cs30
+  TCCR3B |= (1 << WGM32) | (1 << CS32) | (1 << CS30);
+
+  OCR3A = 194;
+  OCR3B = 0;
+
+  TIMSK3 |= (1 << OCIE3A) | (1 << OCIE3B);  // Enable interrupts
+
+  TCCR4A = 0;  // Clear all bits in control register A CIRCUM MOTOR
+
+  // Clear WGM and CS bits
+  TCCR4B &= ~((1 << WGM43) | (1 << WGM42) | (1 << WGM41) | (1 << WGM40));
+  TCCR4B &= ~((1 << CS42) | (1 << CS41) | (1 << CS40));
+
+  // Set CTC mode (WGM42 = 1), Prescaler =  64 cs41 + cs40
+  TCCR4B |= (1 << WGM42) | (1 << CS42) | (1 << CS40);
+
+  OCR4A = 194;
+  OCR4B = 0;
+
+  TIMSK4 |= (1 << OCIE4A) | (1 << OCIE4B);  // Enable interrupts
+
+  TCCR5A = 0;  // Clear all bits in control register A WINCH TIMER
+
+  // Clear WGM and CS bits
+  TCCR5B &= ~((1 << WGM53) | (1 << WGM52) | (1 << WGM51) | (1 << WGM50));
+  TCCR5B &= ~((1 << CS52) | (1 << CS51) | (1 << CS50));
+
+  // Set CTC mode (WGM42 = 1), Prescaler = 1024 (CS42 + CS40)
+  TCCR5B |= (1 << WGM52) | (1 << CS51) | (1 << CS50);
+
+  OCR5A = 194;
+  OCR5B = 0;
+
+  TIMSK5 |= (1 << OCIE5A) | (1 << OCIE5B);  // Enable interrupts
+
+  // --- Clear Timer/Counter Control Registers ---
+  TCCR1A = 0;
+  TCCR1B = 0;
+
+  // --- Set to CTC Mode ---
+  // WGM62:0 = 0b010 → CTC mode for Timer6 (8-bit timer on Mega)
+  TCCR1B |= (1 << WGM12);  // On Mega, Timer6 WGM bits are slightly different
+
+  // --- Set Prescaler ---
+  // Prescaler = 1024
+  TCCR1B |= (1 << CS12) | (1 << CS10);
+
+  OCR1A = 200;
+
+  // --- Enable Timer Compare Interrupt ---
+  TIMSK1 &= ~(1 << OCIE1A);  // Keep off till needed
+  //TIMSK1 |= (1 << OCIE1A);
+
+
+  // Enable global system interrupts
+  sei();
+}
+
+void radioRX() {  // Simply print what was received.
+  if (radio.available()) {
+    radioSent = 1;
+    lastReceivedTime = millis();
+    radio.read(&tempPkt, sizeof(tempPkt));
+    if (isValid(tempPkt)) {  // optional extra safety
+      rxPkt = tempPkt;       // now update the live struct
+    }
+    radio.writeAckPayload(1, ackArr, sizeof(ackArr));
+    //debugRX();
+  }
+}
+
+void rampMotorSpeed(volatile uint16_t* OCRx, uint8_t currentSpeed, uint8_t targetSpeed, uint8_t rampStep, uint16_t rampDelay_us) {
+  if (currentSpeed < targetSpeed) {
+    // Ramp Up
+    for (uint8_t spd = currentSpeed; spd <= targetSpeed; spd += rampStep) {
+      *OCRx = spd;
+      delayMicroseconds(rampDelay_us);
+    }
+  } else {
+    // Ramp Down
+    for (uint8_t spd = currentSpeed; spd >= targetSpeed; spd -= rampStep) {
+      *OCRx = spd;
+      delayMicroseconds(rampDelay_us);
+      if (spd < rampStep) break;  // Prevent underflow when spd becomes < 0
+    }
+  }
+}
+
+void debugRX() {
+
+  // Now print the rest of the packet values
+  // Serial.print(F("Button Pressed: "));
+  // Serial.println(rxPkt.buttonID);
+  // Serial.print(F("Emergency Status: "));
+  // Serial.println(rxPkt.b_EMERGENCY);
+
+  // Serial.print(F("Winch Speed: "));
+  // Serial.println(rxPkt.winch_spd);
+  // Serial.print(F("Winch Direction: "));
+  // Serial.println(rxPkt.winch_dir);
+
+  // Serial.print(F("Traction Speed: "));
+  // Serial.println(rxPkt.traction_spd);
+  // Serial.print(F("Traction Direction: "));
+  // Serial.println(rxPkt.traction_dir);
+
+  // Serial.print(F("Circumferential Speed: "));
+  // Serial.println(rxPkt.circum_spd);
+  // Serial.print(F("Circumferential Direction: "));
+  // Serial.println(rxPkt.circum_dir);
+
+  // Serial.print(F("Radial Speed: "));
+  // Serial.println(rxPkt.radial_spd);
+  // Serial.print(F("Radial Direction: "));
+  // Serial.println(rxPkt.radial_dir);
+}
+
+void manDelay(int del) {
+  int i = 0;
+  while (i < del) {
+    i++;
+  }
+}
+
+void DCTS() {  // Reads the load cell & performs DCTS logic on it
+  //reading = scale.read();
+  //ackArr[0] = reading / 10430.0;
+
+  // If statements that determine when to start retracting/releasing (target weight +- padding)
+
+  if (reading >= (TW_Adj + PLMI_Adj)) {  // If above padding
+    temp_OCR5B = (reading - TW_Adj) / 10500; //readjusting the linear part of the equation to be 1/7th the original slope. this allows for a wider range of tension values to be apart of the equation
+    OCR5B = constrain((uint8_t)temp_OCR5B, 12, 30); //readjusting the constrain values to be 1/4th the originals. this gives limits the power of the winch system to operate at 1/4th the power it originally had
+    digitalWrite(Winch_DIR, HIGH);
+    // // Serial.print(OCR5B);
+    //// Serial.print("HIGH ");
+
+  } else if (reading <= (TW_Adj - PLMI_Adj)) {  // If below padding
+    temp_OCR5B = (TW_Adj - reading) / 10500;     // For constant slow speed -> temp_OCR4B = 20;
+    OCR5B = constrain((uint8_t)temp_OCR5B, 12, 30);
+    digitalWrite(Winch_DIR, LOW);
+    // // Serial.print(OCR5B);
+    // // Serial.print("LOW ");
+
+  } else {  // If within the padding range, do nothing and brake.
+    temp_OCR5B = 0;
+    OCR5B = temp_OCR5B;
+  }
+}
+
+void manualCircumControl(int speed, bool dir) { 
+  temp_OCR4B = speed;
+  OCR4B = constrain((uint8_t)temp_OCR4B, 0, 180);
+  if (dir) {
+    digitalWrite(Circumferential_DIR, LOW);
+  } else {
+    digitalWrite(Circumferential_DIR, HIGH);
+  }
+}
+void manualTensionControl(int speed, bool dir) { 
+  temp_OCR5B = speed;
+  OCR5B = constrain((uint8_t)temp_OCR5B, 0, 150);
+  if (dir) {
+    digitalWrite(Winch_DIR, HIGH);
+  } else {
+    digitalWrite(Winch_DIR, LOW);
+  }
+}
+
+void manualTractControl(int speed, bool dir) {
+  // temp_OCR3B = speed;
+  // OCR3B = constrain((uint8_t)temp_OCR3B, 0, 100);
+  // if (dir) {
+  //   digitalWrite(TractionWheel1_DIR, HIGH);
+  //   digitalWrite(TractionWheel2_DIR, HIGH);
+  //   digitalWrite(TractionWheel3_DIR, HIGH);
+  // } else {
+  //   digitalWrite(TractionWheel1_DIR, LOW);
+  //   digitalWrite(TractionWheel2_DIR, LOW);
+  //   digitalWrite(TractionWheel3_DIR, LOW);
+  // }
+  // if (currDIR != dir) {  // When direction is changed, wait 1000 loop cycles before you can move it
+  //   OCR3B = 0;
+  //   if (dirCTR < 1000) {
+  //     dirCTR++;
+  //     if (DCTS_EN) {
+  //       dirCTR += 100;
+  //     }
+  //     //// Serial.println(dirCTR);
+  //   } else {
+  //     currDIR = dir;
+  //     dirCTR = 0;
+  //   }
+  // } else {
+  //rampMotorSpeed(&OCR3B, OCR3B, constrain((uint8_t)speed, 0, 130), 1, 3000);
+  temp_OCR3B = speed;
+  OCR3B = constrain((uint8_t)temp_OCR3B, 0, 193);
+  if (dir) {
+    digitalWrite(TractionWheel1_DIR, LOW);
+    digitalWrite(TractionWheel2_DIR, LOW);
+    digitalWrite(TractionWheel3_DIR, LOW);
+  } else {
+    digitalWrite(TractionWheel1_DIR, HIGH);
+    digitalWrite(TractionWheel2_DIR, HIGH);
+    digitalWrite(TractionWheel3_DIR, HIGH);
+  }
+  //}
+}
+
+void manualRadialControl(bool on, bool dir) {
+  if (on) {
+    TIMSK1 |= (1 << OCIE1A);
+    if (dir) {
+      digitalWrite(Stepper_DIR, HIGH);
+    } else {
+      digitalWrite(Stepper_DIR, LOW);
+    }
+  } else {
+    TIMSK1 &= ~(1 << OCIE1A);
+  }
+}
+
+void manualController() {
+  switch (testchar) {
+    case 'E':  // Emergency
+      // Handle 'E'
+      // Serial.println("E Pressed.");
+      emergency();
+      break;
+
+    case 'O':  // Stop traction wheels
+      // Handle 'E'
+      // Serial.println("O Pressed.");
+      manualTractControl(50, 1);
+      break;
+
+    case 'P':  // Up on traction wheels
+      // Handle 'E'
+      // Serial.println("P Pressed.");
+      manualTractControl(50, 0);
+      break;
+
+    case 'I':
+      // Handle 'E'
+      // Serial.println("I Pressed.");
+      manualTractControl(0, 0);
+      break;
+
+    case 'F':
+      // Handle 'F'
+      // Serial.println("F Pressed.");
+      //manualTractControl(50, 1);
+      //TIMSK5 |= (1 << OCIE5A);
+      manualTensionControl(100, 1);
+      //manualCircumControl(100, 1);
+      //manualRadialControl(1, 1);
+      break;
+
+    case 'R':
+      // Handle 'R'
+      // Serial.println("R Pressed.");
+      //manualTractControl(50, 0);
+      //TIMSK5 |= (1 << OCIE5A);
+      manualTensionControl(100, 0);
+      //manualCircumControl(100, 0);
+      //manualRadialControl(1, 0);
+      break;
+
+    case 'Q':
+      // Handle 'R'
+      // Serial.println("Q Pressed.");
+      // manualTractControl(50, 0);
+      //manualTensionControl(100, 0);
+      //manualCircumControl(100, 0);
+      manualRadialControl(1, 0);
+      break;
+
+    case 'W':
+      // Handle 'R'
+      // Serial.println("W Pressed.");
+      // manualTractControl(50, 0);
+      //manualTensionControl(100, 0);
+      //manualCircumControl(100, 0);
+      manualRadialControl(1, 1);
+      break;
+
+    case 'T':
+      // Handle 'R'
+      // Serial.println("T Pressed.");
+      // manualTractControl(50, 0);
+      //manualTensionControl(100, 0);
+      manualCircumControl(100, 0);
+      //manualRadialControl(1, 0);
+      break;
+
+    case 'Y':
+      // Handle 'R'
+      // Serial.println("Y Pressed.");
+      // manualTractControl(50, 0);
+      //manualTensionControl(100, 0);
+      manualCircumControl(100, 1);
+      //manualRadialControl(1, 0);
+      break;
+
+    case 'S':
+      // Handle 'R'
+      // Serial.println("S Pressed.");
+      //TIMSK5 &= ~(1 << OCIE5A);
+      manualTractControl(0, 0);
+      manualTensionControl(0, 0);
+      manualTractControl(0, 0);
+      manualCircumControl(0, 0);
+      manualRadialControl(0, 0);
+      break;
+
+    case 'C':
+      // Handle 'E'
+      // Serial.println("E Pressed.");
+      digitalWrite(Chainsaw_EN, HIGH);
+      //DCTS_EN = 1;
+      break;
+
+    case 'N':
+      // Handle 'E'
+      // Serial.println("E Pressed.");
+      //DCTS_EN = 0;
+      digitalWrite(Chainsaw_EN, LOW);
+      break;
+
+    case 'Z':
+      // Handle 'E'
+      // Serial.println("E Pressed.");
+      //DCTS_EN = 0;
+      //TIMSK4 &= ~(1 << OCIE4A);
+      //TIMSK5 &= ~(1 << OCIE5A);
+      break;
+
+    case 'X':
+      // Handle 'E'
+      // Serial.println("E Pressed.");
+      //DCTS_EN = 0;
+      //TIMSK4 |= (1 << OCIE4A);
+      //TIMSK5 |= (1 << OCIE5A);
+      break;
+
+    default:
+      // Do nothing for any other character
+      break;
+  }
+
+
+  /*if ( Serial.available() > 0) {  // Read serial values from the serial monitor on debug laptop
+    testchar = toUpperCase(// Serial.read());
+  }*/
+}
+
+
+/*void readDebug() {  // Read multiple digit values from serial monitor to send mock values for load/distance vals
+  if (Serial.available() > 0) {
+    String s = Serial.readStringUntil('\n');  // read up to newline
+    s.trim();                                 // strip CR/LF
+    int val = s.toInt();                      // convert "203" → 203
+    ackArr[0] = val;                          // ‘5’ → 5
+    radio.writeAckPayload(1, ackArr, sizeof(ackArr));
+    // Serial.print("ACK set to: ");
+    // Serial.println(ackArr[0]);
+  }
+}*/
+
+void buttonSel() {  // Switch case for buttons pressed on the remote controller
+  switch (rxPkt.buttonID) {
+    case '1':
+      // Serial.println("1 Pressed.");
+      DCTS_EN = 1;
+      break;
+
+    case '2':
+      // Handle 'F'
+      // Serial.println("2 Pressed.");
+      DCTS_EN = 0;
+      break;
+
+    case '3':
+      // Handle 'R'
+      // Serial.println("3 Pressed.");
+
+      break;
+
+    case '4':
+      // Handle 'R'
+      // Serial.println("4 Pressed.");
+      // reading = scale.read();
+      // ackArr[0] = reading / 10430.0;
+      break;
+
+    case '5':
+      // Handle 'E'
+      // Serial.println("5 Pressed.");
+      digitalWrite(Chainsaw_EN, HIGH);
+      break;
+
+    case '6':
+      // Handle 'E'
+      // Serial.println("6 Pressed.");
+      digitalWrite(Chainsaw_EN, LOW);
+      break;
+
+    case '7':
+      // Handle 'E'
+      // Serial.println("7 Pressed.");
+
+      break;
+
+    case '8':
+      // Handle 'E'
+      // Serial.println("8 Pressed.");
+
+      break;
+
+    default:
+      // Do nothing for any other character
+      break;
+  }
+}
+
+void printControllerDebug() {  // Prints every joystick value
+  radioRX();
+  // Serial.print(F("Winch Speed: "));
+  // Serial.println(rxPkt.winch_spd);
+  // Serial.print(F("Winch Direction: "));
+  // Serial.println(rxPkt.winch_dir ? "Forward" : "Reverse");
+
+  // Serial.print(F("Traction Speed: "));
+  // Serial.println(rxPkt.traction_spd);
+  // Serial.print(F("Traction Direction: "));
+  // Serial.println(rxPkt.traction_dir ? "Forward" : "Reverse");
+
+  // Serial.print(F("Circumferential Speed: "));
+  // Serial.println(rxPkt.circum_spd);
+  // Serial.print(F("Circumferential Direction: "));
+  // Serial.println(rxPkt.circum_dir ? "Forward" : "Reverse");
+
+  // Serial.print(F("Radial Speed: "));
+  // Serial.println(rxPkt.radial_spd);
+  // Serial.print(F("Radial Direction: "));
+  // Serial.println(rxPkt.radial_dir ? "Forward" : "Reverse");
+
+  // Serial.println();  // Blank line for readability
+}
+
+void ultraSonic() {
+  digitalWrite(Ultrasonic_TRIG, LOW);
+  // manDelay(2);
+  // delayMicroseconds(2);
+  digitalWrite(Ultrasonic_TRIG, HIGH);
+  // delayMicroseconds(10);
+  // manDelay(10);
+  digitalWrite(Ultrasonic_TRIG, LOW);
+  ultra_dur = pulseIn(Ultrasonic_ECHO, HIGH, 30000);
+  ultra_dis = ultra_dur * 0.0343 / 2;
+  // Serial.println(ultra_dur);
+  // Serial.println(ultra_dis);
+}
+
+void setup() {  // Runs all initializing functions
+  Serial.begin(115200);
+  radioInit();
+  Serial.println("Done Initializing.");
+  pinInit();
+  loadCellInit();
+  PWMTimerInit();
+
+  printf_begin();
+  radio.printPrettyDetails();
+}
+
+void mainControl() {  // Manages all movement and calls radio RX function
+  radioRX();
+  if (millis() - lastReceivedTime > connectionTimeout) {
+    radioSent = 0;  // Lost connection
+  }
+
+  if (scale.is_ready()) {
+    reading = scale.read();
+    ackArr[0] = reading / 10430.0;
+    ultraSonic();
+    ackArr[1] = ultra_dis;
+    //// Serial.println(ackArr[0]);
+  }
+  // Get reading
+  //// Serial.println(radioSent);
+  if (radioSent) {  // Only do this stuff if packets are being sent radioSent
+
+    if (rxPkt.b_EMERGENCY) {  // If emergency button is pressed at all
+      emergency();
+    }
+    if (rxPkt.tensionSet != Target_Weight && rxPkt.tensionSet < 176) {  // If a new tension is detected, set it and make sure its between 10 and 175
+      Target_Weight = constrain((uint8_t)rxPkt.tensionSet, 10, 175);
+      TW_Adj = Target_Weight * (long)10430;
+      // Serial.print("New tension set: ");
+      // Serial.println(Target_Weight);
+    }
+    if (DCTS_EN) {  // If the DCTS is enabled
+      DCTS();
+    } else {  // If DCTS isn't enabled, allow manual control
+      manualTensionControl(rxPkt.winch_spd, rxPkt.winch_dir);
+    }
+
+    buttonSel();  // Button logic
+
+    // Manual control of motors
+    manualCircumControl(rxPkt.circum_spd, rxPkt.circum_dir);
+    manualTractControl(rxPkt.traction_spd, rxPkt.traction_dir);
+    manualRadialControl(((rxPkt.radial_spd > 20)), rxPkt.radial_dir);
+
+    // if (rxPkt.winch_spd < rxPkt.circum_spd) {  // If DCTS isn't enabled, allow manual control
+    //   manualCircumControl(rxPkt.circum_spd, rxPkt.circum_dir);
+    // }
+    // if (rxPkt.traction_spd > rxPkt.radial_spd) {  // If DCTS isn't enabled, allow manual control
+    //   manualTractControl(rxPkt.traction_spd, rxPkt.traction_dir);
+    // } else {
+    //   manualRadialControl(((rxPkt.radial_spd > 20)), rxPkt.radial_dir);
+    // }
+  } else {
+    manualCircumControl(0, 0);
+    manualTractControl(0, 0);
+    manualTensionControl(0, 0);
+    manualRadialControl(0, 0);
+  }
+}
+
+void loop() {
+  //manualController();
+  //loadCellDebug();
+  // if (DCTS_EN) {
+  //   DCTS();
+  // }
+  //printControllerDebug();
+  //readDebug();
+  //ultraSonic();
+  mainControl();  // This is the only function that needs to be in here
+}
+
+
+// Timer Handling the PWM signal for the motor.
+ISR(TIMER3_COMPA_vect) {
+  if (OCR3B != 0) {
+    digitalWrite(TractionWheel1_PWM, HIGH);
+    digitalWrite(TractionWheel2_PWM, HIGH);
+    digitalWrite(TractionWheel3_PWM, HIGH);
+  }
+}
+ISR(TIMER3_COMPB_vect) {
+  digitalWrite(TractionWheel1_PWM, LOW);
+  digitalWrite(TractionWheel2_PWM, LOW);
+  digitalWrite(TractionWheel3_PWM, LOW);
+}
+ISR(TIMER4_COMPA_vect) {  // Winch
+  if (OCR4B != 0) {
+    digitalWrite(Circumferential_PWM, HIGH);
+  }
+}
+
+ISR(TIMER4_COMPB_vect) {
+  digitalWrite(Circumferential_PWM, LOW);
+}
+
+ISR(TIMER5_COMPA_vect) {  // Winch
+  if (OCR5B != 0) {
+    digitalWrite(Winch_PWM, HIGH);
+  }
+}
+
+ISR(TIMER5_COMPB_vect) {
+  digitalWrite(Winch_PWM, LOW);
+}
+
+ISR(TIMER1_COMPA_vect) {
+  digitalWrite(Stepper_PWM, !digitalRead(Stepper_PWM));  // Toggle Stepper pin
+}
