@@ -185,16 +185,13 @@ void radioInit() {  // Intializes RF, this is used for both RX and TX
 
 void emergency() {  // Turn off all motors when emergency button is pressed and stay locked in it
   // Serial.println("EMERGENCY PRESSED");
+  DCTS_EN = 0;  // Require the operator to re-enable automatic tension after recovery
   manualCircumControl(0, 0);
   manualTractControl(0, 0);
   manualTensionControl(0, 0);
   manualRadialControl(0, 0);
-  while (1) {  // Stay locked in emergency until 7 and Emergency buttons are pressed
+  while (rxPkt.b_EMERGENCY) {  // Stay locked until the controller explicitly clears its emergency state
     radioRX();
-    if (rxPkt.winch_spd > 100 && rxPkt.buttonID == '8') {  // If Emergency button and 7 are pressed at the same time, exit Emergency mode
-      // Serial.println("EMERGENCY AVERTED");
-      break;
-    }
   }
   resetPID();  // The load cell went unread while locked, don't resume on stale readings
 }

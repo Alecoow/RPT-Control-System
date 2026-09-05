@@ -162,7 +162,7 @@ Grouped by purpose (each is fully defined in the [glossary](#8-glossary--master-
 
 **`radioInit()` (L174–184)** — Configures the radio for **receiving** (see [section 2](#2-how-the-two-boards-talk-the-rf-link)): begin, 250 kbps, PA low, channel 76, open reading pipe 1 on the shared address, dynamic payloads, ack payloads, auto-ack on, then `startListening()`.
 
-**`emergency()` (L186–200)** — Hard stop. Calls all four manual control functions with zero speed (circum, traction, tension, radial), then **enters an infinite `while(1)` loop** that does nothing but call `radioRX()` until the operator presses the emergency button *and* button 7's slot is satisfied — specifically it breaks only when `rxPkt.winch_spd > 100 && rxPkt.buttonID == '8'`. Until then the machine is locked. *(This is a blocking, intentionally trapping state.)* On the way out it calls `resetPID()` (L199): the load cell is never read inside the lock, so without this the PID would resume on pre-e-stop tension data with a stale integrator.
+**`emergency()` (L186–197)** — Hard stop. Disables `DCTS_EN`, calls all four manual control functions with zero speed (circum, traction, tension, radial), then remains in a blocking receive loop while `rxPkt.b_EMERGENCY` is true. The controller repeatedly transmits zero-motion emergency packets, and the deliberate Emergency + Button 8 recovery gesture sends `b_EMERGENCY = 0`. The clear packet is therefore the only exit condition; stale joystick speed or button fields cannot release the lock. On the way out the master calls `resetPID()`, and automatic tension must be explicitly re-enabled by the operator.
 
 **`PWMTimerInit()` (L201–266)** — Configures the AVR hardware timers that generate motor PWM. Detailed in [section 6](#6-the-timer--pwm-subsystem). Ends with `sei()` to enable global interrupts.
 
@@ -216,7 +216,7 @@ Grouped by purpose (each is fully defined in the [glossary](#8-glossary--master-
 2. If `millis() - lastReceivedTime > connectionTimeout` (200 ms) → `radioSent = 0` (connection considered lost).
 3. If `scale.is_ready()` (L821–836): `reading = scale.read()` (L822); range-check it against `RAW_MIN_VALID`–`RAW_MAX_VALID`, setting `sensorValid` and, when valid, converting `measured_lbs = reading / QUANTA_PER_LB` (L823–828); set the PID's fresh-sample latch `newSample = true`, **but only when `DCTS_EN`** (L829–831), so the latch can't go stale during manual control; then `ackArr[0] = reading / 10430.0` (load in lbs), `ultraSonic()`, `ackArr[1] = ultra_dis` (range in cm). *(So both ack bytes are refreshed only when the load cell is ready.)*
 4. **If `radioSent` (link is alive):**
-   - If `rxPkt.b_EMERGENCY` → `emergency()` (lock down).
+   - If `rxPkt.b_EMERGENCY` → `emergency()` (lock down until an explicit clear packet, and disable automatic tension).
    - If `rxPkt.tensionSet != Target_Weight && rxPkt.tensionSet < 176` → adopt the new setpoint: `Target_Weight = constrain(rxPkt.tensionSet, 10, 175)` (L845) — this is now the PID's setpoint, in lbs — recompute `TW_Adj` (L846; vestigial, the PID no longer reads it), and `resetPID()` (L847) so the old integrator isn't carried into the new setpoint.
    - **The tension mode switch** (L851–855): if `DCTS_EN` → run `DCTS()` (the PID, auto); else → `manualTensionControl(rxPkt.winch_spd, rxPkt.winch_dir)` (manual).
    - `buttonSel()` — handle the reported button.
@@ -413,7 +413,7 @@ So the full winch chain is: **`mainControl()` acquires the reading → `DCTS()` 
 - In `mainControl()` (L851–855), `DCTS_EN` chooses between `DCTS()` (the PID, auto) and `manualTensionControl()` (manual). **They are mutually exclusive and both own `OCR5B` and `Winch_DIR`.**
 - **`manualTensionControl()`** (L493–501) is the manual twin: same outputs, constrained 0–150 instead of 12–30, direction taken from the joystick.
 - The PID's setpoint is `Target_Weight` itself (lbs), adopted at L844–845. The quanta-converted `TW_Adj` is still recomputed at L846 but is no longer read by any control path.
-- **`resetPID()` is called at every boundary where the winch changes hands**, so the loop can never resume on stale memory. There are five call sites: `setup()` (L809, initial `dt` clock), `buttonSel()` on a genuine DCTS off→on transition (L708) and on every off (L717), the setpoint-change branch (L847), `emergency()` on the way out of the e-stop lock (L199), and the link-lost failsafe (L877).
+- **`resetPID()` is called at every boundary where the winch changes hands**, so the loop can never resume on stale memory. There are six call sites: `setup()` (initial `dt` clock), `buttonSel()` on a genuine DCTS off→on transition and on every off, the setpoint-change branch, `emergency()` on the way out of the e-stop lock, and the link-lost failsafe.
 
 ### 5.5 Other code that writes the winch outputs
 
@@ -422,7 +422,7 @@ These also set `OCR5B`/`Winch_DIR`:
 - `mainControl()` link-lost branch (L875) — `manualTensionControl(0, 0)`.
 - `manualController()` debug cases `'F'`/`'R'` (L587, L597) and `'S'` (L643) — only if the serial debug path is re-enabled.
 
-**They do not simply "win" over the PID — the ordering matters, and in one case it runs the other way.** Within `mainControl()`, `emergency()` is called *before* the `DCTS_EN` branch, so when the operator exits the e-stop lock, control falls straight through and `DCTS()` runs in that same iteration — the PID reasserts a duty right after the e-stop zeroed it. That is why `emergency()` ends with `resetPID()` (L199); the reassertion is now at least based on a fresh sample and a clean integrator rather than pre-e-stop data. The link-lost branch is not a race at all: it is the `else` of `if (radioSent)`, so `DCTS()` cannot run in the same iteration.
+**They do not simply "win" over the PID — the ownership state matters.** `emergency()` clears `DCTS_EN` before stopping the outputs, so recovery falls through to manual tension control with the zero-speed clear packet rather than automatically restarting the PID. `resetPID()` also clears stale loop state. The operator must deliberately press Button 1 to re-enable automatic tension after recovery. The link-lost branch is the `else` of `if (radioSent)`, so `DCTS()` cannot run in the same iteration.
 
 Note: `winchStop()` only clears `OCR5B` (duty 0 = motor off); it leaves `Winch_DIR` at its last value. That is harmless while the duty is zero, but it means the direction pin can sit stale between PID stops.
 
@@ -529,9 +529,9 @@ Nine buttons, each on a digital pin with `INPUT_PULLUP` (reads LOW when pressed)
 - set `packet.buttonID = '1' + i` (so index 0→'1', … 7→'8'),
 - `SendPacket()`.
 
-**`CheckEmergencyButton()` (L172–220)** — Two-state e-stop:
-- **Normal → emergency:** if the emergency button reads LOW, set `emergencyButtonState = true`, send a packet with `b_EMERGENCY = 1` and `buttonID = '8'`, print the warning, and flash the LCD 5 times (using blocking `delay(200)`).
-- **Emergency → recover:** if both the emergency button **and** button 8 read LOW, clear `emergencyButtonState`, send `b_EMERGENCY = 0`, show "SYSTEM RECOVERED", and `delay(2000)`.
+**`CheckEmergencyButton()`** — Two-state e-stop:
+- **Normal → emergency:** if the emergency button reads LOW, set `emergencyButtonState = true`, zero every motion speed, and send `b_EMERGENCY = 1`. The LCD warning still flashes, but another emergency packet is sent after each blocking flash delay so a lost first packet cannot leave the master unaware.
+- **Emergency → recover:** if both the emergency button **and** Button 8 read LOW, clear `emergencyButtonState`, keep every motion speed at zero, and send `b_EMERGENCY = 0` with `buttonID = '8'`. The master exits only on this cleared emergency state, shows "SYSTEM RECOVERED", and requires Button 1 before automatic tension can run again.
 
 **`ReadJoystick()` (L222–275)** — Reads all four analog joystick axes, then calls `JoystickLeftPWM()` and `JoystickRightPWM()` to convert them into packet fields. The commented block at the bottom is a serial-print map of each direction's meaning.
 
@@ -550,8 +550,8 @@ Nine buttons, each on a digital pin with `INPUT_PULLUP` (reads LOW when pressed)
 - **`setDist` mode:** if button '8' or `conf` → "Confirmed N cm". Otherwise read pot, `mapPotVal = map(potVal, 0,1023, 0,99)`, show "Set Range: N cm".
 - **Default (neither):** show live telemetry from the machine — "Load: `ackArr[0]` lbs" (or "255+" if saturated) on line 1, "Range: `ackArr[1]` cm" (or "200+") on line 2.
 
-**`loop()` (L485–516)** — Each iteration:
-1. `CheckEmergencyButton()` first. If in emergency, `return` immediately (freeze — send nothing else).
+**`loop()`** — Each iteration:
+1. `CheckEmergencyButton()` first. If in emergency, zero all motion commands, transmit another `b_EMERGENCY = 1` packet, and return without processing normal controls.
 2. `ReadJoystick()` → refresh joystick fields.
 3. Set `packet.buttonID = '0'` (no button) and `SendPacket()` — sends the continuous joystick stream.
 4. Run all eight `CheckButtonDebouncePressed(...)` checks (each may send its own packet on a press).
@@ -742,7 +742,7 @@ These are factual observations from reading the code — **not** changes. Flagge
 
 5. **`isValid()` is a stub** (master L104–107) — always returns `true`, so no packet validation actually happens despite the staging-buffer pattern in `radioRX()`.
 
-6. **`emergency()` blocks the whole machine** (master L186–200) in a `while(1)` until a specific recovery combo (`winch_spd > 100 && buttonID == '8'`). While locked, only `radioRX()` runs; sensors and the main loop are frozen. Because the load cell is not read inside the lock, the function ends with `resetPID()` (L199) — otherwise the PID would resume on pre-e-stop tension data the moment control returns to `mainControl()`, in the very same iteration (see [5.5](#55-other-code-that-writes-the-winch-outputs)).
+6. **`emergency()` intentionally blocks normal machine processing** while `b_EMERGENCY` remains true. During the lock only `radioRX()` runs; sensors and the main loop are frozen. The controller continually retries zero-motion emergency packets and clears the state only through Emergency + Button 8. The master disables `DCTS_EN` and resets the PID, so automatic tension cannot restart without a deliberate Button 1 command after recovery.
 
 7. **Blocking delays exist** in `loadCellInit()` (`delay(500)`), `rampMotorSpeed()` (`delayMicroseconds`), and on the remote in `CheckEmergencyButton()` (`delay(200)` ×10, `delay(2000)`). These run outside the steady-state control path but are worth noting for the project's "non-blocking" goal.
 

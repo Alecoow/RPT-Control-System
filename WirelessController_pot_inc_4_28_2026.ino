@@ -91,6 +91,13 @@ ControllerPacket packet = { '9', 0, 0, 0, 0, 0, 0, 0, 0, 0, 20 };
 // Initliaze and decalre receiving variables
 uint8_t ackArr[2] = { 0, 0 };
 
+void ZeroMotionCommands() {
+  packet.winch_spd = 0;
+  packet.traction_spd = 0;
+  packet.circum_spd = 0;
+  packet.radial_spd = 0;
+}
+
 void setup() {
   Serial.begin(115200);  // Start Serial Monitor
 
@@ -179,8 +186,9 @@ void CheckEmergencyButton() {
       emergencyButtonState = true;  // Enter emergency mode
       Serial.println("EMERGENCY BUTTON PRESSED - SYSTEM SHUTDOWN!");
 
+      ZeroMotionCommands();
       packet.b_EMERGENCY = 1;
-      packet.buttonID = '8';
+      packet.buttonID = '0';
       SendPacket();
 
       // LCD Print Warning
@@ -194,8 +202,10 @@ void CheckEmergencyButton() {
       for (int i = 0; i < 5; i++) {
         lcd.noBacklight();
         delay(200);
+        SendPacket();  // Retry the emergency state while the display is blocking
         lcd.backlight();
         delay(200);
+        SendPacket();
       }
     }
   } else {
@@ -204,7 +214,9 @@ void CheckEmergencyButton() {
       emergencyButtonState = false;  // Exit emergency mode
       Serial.println("EMERGENCY RECOVERED - SYSTEM CONTINUING OPERATION");
 
+      ZeroMotionCommands();
       packet.b_EMERGENCY = 0;  // Notify system recovery
+      packet.buttonID = '8';
       SendPacket();
 
       // LCD Recovery Message
@@ -486,8 +498,11 @@ void loop() {
   // Always check emergency button first
   CheckEmergencyButton();
   if (emergencyButtonState) {
-    // if emergency Button State is active do nothing until manually recovered
-    return;  // Skip all other inputs and stop everything from working
+    ZeroMotionCommands();
+    packet.b_EMERGENCY = 1;
+    packet.buttonID = '0';
+    SendPacket();  // Keep asserting the stop until the recovery packet is sent
+    return;
   }
 
   // Read Joystick Movements
