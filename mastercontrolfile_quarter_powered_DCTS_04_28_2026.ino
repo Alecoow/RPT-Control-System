@@ -165,6 +165,7 @@ void pinInit() {  // Initialize every pin we will use according to Arduino Mega 
   pinMode(Stepper_DIR, OUTPUT);
 
   pinMode(Chainsaw_EN, OUTPUT);
+  digitalWrite(Chainsaw_EN, LOW);  // Fail safe: cutting tool starts disabled
 
   pinMode(Ultrasonic_TRIG, OUTPUT);
   pinMode(Ultrasonic_ECHO, OUTPUT);
@@ -190,6 +191,7 @@ void emergency() {  // Turn off all motors when emergency button is pressed and 
   manualTractControl(0, 0);
   manualTensionControl(0, 0);
   manualRadialControl(0, 0);
+  digitalWrite(Chainsaw_EN, LOW);
   while (rxPkt.b_EMERGENCY) {  // Stay locked until the controller explicitly clears its emergency state
     radioRX();
   }
@@ -871,6 +873,7 @@ void mainControl() {  // Manages all movement and calls radio RX function
     manualTractControl(0, 0);
     manualTensionControl(0, 0);
     manualRadialControl(0, 0);
+    digitalWrite(Chainsaw_EN, LOW);
     resetPID();  // Link is down, start clean when it comes back
   }
 }

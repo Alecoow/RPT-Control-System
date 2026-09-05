@@ -158,11 +158,11 @@ Grouped by purpose (each is fully defined in the [glossary](#8-glossary--master-
 
 **`loadCellDebug()` (L136–148)** — Entirely commented out. A no-op stub left for debugging the raw/converted load readings. (Mentions the conversions: ÷10430 → lbs, ÷22998 → kg.)
 
-**`pinInit()` (L150–172)** — Sets `pinMode(..., OUTPUT)` on every motor PWM pin, every direction pin, the chainsaw enable, and the ultrasonic TRIG. Also sets `Ultrasonic_ECHO` as OUTPUT then drives TRIG LOW. *(Note: ECHO is configured OUTPUT here even though it's read as an input by `pulseIn`; see [Known Issues](#10-known-issues-quirks-and-things-to-verify).)*
+**`pinInit()` (L150–173)** — Sets `pinMode(..., OUTPUT)` on every motor PWM pin, every direction pin, the chainsaw enable, and the ultrasonic TRIG. It explicitly drives `Chainsaw_EN` LOW so the cutting tool starts disabled. It also sets `Ultrasonic_ECHO` as OUTPUT then drives TRIG LOW. *(Note: ECHO is configured OUTPUT here even though it's read as an input by `pulseIn`; see [Known Issues](#10-known-issues-quirks-and-things-to-verify).)*
 
 **`radioInit()` (L174–184)** — Configures the radio for **receiving** (see [section 2](#2-how-the-two-boards-talk-the-rf-link)): begin, 250 kbps, PA low, channel 76, open reading pipe 1 on the shared address, dynamic payloads, ack payloads, auto-ack on, then `startListening()`.
 
-**`emergency()` (L186–197)** — Hard stop. Disables `DCTS_EN`, calls all four manual control functions with zero speed (circum, traction, tension, radial), then remains in a blocking receive loop while `rxPkt.b_EMERGENCY` is true. The controller repeatedly transmits zero-motion emergency packets, and the deliberate Emergency + Button 8 recovery gesture sends `b_EMERGENCY = 0`. The clear packet is therefore the only exit condition; stale joystick speed or button fields cannot release the lock. On the way out the master calls `resetPID()`, and automatic tension must be explicitly re-enabled by the operator.
+**`emergency()`** — Hard stop. Disables `DCTS_EN`, stops all four motion systems, and drives `Chainsaw_EN` LOW before remaining in a blocking receive loop while `rxPkt.b_EMERGENCY` is true. The controller repeatedly transmits zero-motion emergency packets, and the deliberate Emergency + Button 8 recovery gesture sends `b_EMERGENCY = 0`. The clear packet is therefore the only exit condition; stale joystick speed or button fields cannot release the lock. On the way out the master calls `resetPID()`, and automatic tension must be explicitly re-enabled by the operator.
 
 **`PWMTimerInit()` (L201–266)** — Configures the AVR hardware timers that generate motor PWM. Detailed in [section 6](#6-the-timer--pwm-subsystem). Ends with `sei()` to enable global interrupts.
 
@@ -221,7 +221,7 @@ Grouped by purpose (each is fully defined in the [glossary](#8-glossary--master-
    - **The tension mode switch** (L851–855): if `DCTS_EN` → run `DCTS()` (the PID, auto); else → `manualTensionControl(rxPkt.winch_spd, rxPkt.winch_dir)` (manual).
    - `buttonSel()` — handle the reported button.
    - Manual drive of the other actuators: `manualCircumControl(...)`, `manualTractControl(...)`, `manualRadialControl((rxPkt.radial_spd > 20), rxPkt.radial_dir)` (stepper turns on only past a speed threshold of 20).
-5. **Else (link lost)** (L872–878): zero everything — circum, traction, tension, radial all set to 0 — and `resetPID()` (L877) so the loop starts clean when the link returns. This is the failsafe when packets stop arriving.
+5. **Else (link lost):** zero every motion system, drive `Chainsaw_EN` LOW, and call `resetPID()` so the loop starts clean when the link returns. The cutting tool therefore cannot remain latched on after RF traffic stops.
 
 **`loop()` (L881–891)** — Calls only `mainControl()`. Everything else (`manualController`, debug, standalone ultrasonic) is commented out. The comment confirms: *"This is the only function that needs to be in here."*
 
@@ -421,6 +421,8 @@ These also set `OCR5B`/`Winch_DIR`:
 - `emergency()` → `manualTensionControl(0, 0)` (L190) — stop on e-stop.
 - `mainControl()` link-lost branch (L875) — `manualTensionControl(0, 0)`.
 - `manualController()` debug cases `'F'`/`'R'` (L587, L597) and `'S'` (L643) — only if the serial debug path is re-enabled.
+
+Both the emergency and link-lost paths also drive `Chainsaw_EN` LOW. Turning the chainsaw on again always requires a new Button 5 command after either safety event.
 
 **They do not simply "win" over the PID — the ownership state matters.** `emergency()` clears `DCTS_EN` before stopping the outputs, so recovery falls through to manual tension control with the zero-speed clear packet rather than automatically restarting the PID. `resetPID()` also clears stale loop state. The operator must deliberately press Button 1 to re-enable automatic tension after recovery. The link-lost branch is the `else` of `if (radioSent)`, so `DCTS()` cannot run in the same iteration.
 
