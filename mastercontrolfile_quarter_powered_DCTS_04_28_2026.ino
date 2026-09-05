@@ -196,6 +196,7 @@ void emergency() {  // Turn off all motors when emergency button is pressed and 
       break;
     }
   }
+  resetPID();  // The load cell went unread while locked, don't resume on stale readings
 }
 
 void PWMTimerInit() {  // initializes the PWM for motor speed
@@ -331,30 +332,153 @@ void manDelay(int del) {
   }
 }
 
-void DCTS() {  // Reads the load cell & performs DCTS logic on it
-  //reading = scale.read();
-  //ackArr[0] = reading / 10430.0;
+//////////////////
+// Winch Tension PID
+// Feedback is the load cell converted to lbs, the setpoint is Target_Weight from the
+// controller pot, and the signed PID effort becomes a winch duty (OCR5B) plus a
+// direction on Winch_DIR. Steps once per fresh load cell sample, using the real
+// elapsed time as dt.
 
-  // If statements that determine when to start retracting/releasing (target weight +- padding)
+const float QUANTA_PER_LB = 10430.0f;         // Quanta per pound, same slope as the ack conversion
+const uint8_t WINCH_DUTY_MIN = 12;            // Stall floor, below this the winch won't turn
+const uint8_t WINCH_DUTY_MAX = 30;            // Quarter power ceiling
+const float TENSION_DEADBAND_LBS = 2.0f;      // Error padding, within this we brake
+const float TENSION_HARD_LIMIT_LBS = 185.0f;  // Never pull past this
+const long RAW_MIN_VALID = -50000L;           // Reject readings below this. PLACEHOLDER, verify on the rig
+const long RAW_MAX_VALID = 3000000L;          // Reject readings above this. PLACEHOLDER, verify on the rig
 
-  if (reading >= (TW_Adj + PLMI_Adj)) {  // If above padding
-    temp_OCR5B = (reading - TW_Adj) / 10500; //readjusting the linear part of the equation to be 1/7th the original slope. this allows for a wider range of tension values to be apart of the equation
-    OCR5B = constrain((uint8_t)temp_OCR5B, 12, 30); //readjusting the constrain values to be 1/4th the originals. this gives limits the power of the winch system to operate at 1/4th the power it originally had
-    digitalWrite(Winch_DIR, HIGH);
-    // // Serial.print(OCR5B);
-    //// Serial.print("HIGH ");
+// PID gains. Tune on the bench, ideally in WinchTensionPID_test first.
+float Kp = 1.5f;  // Duty per lb
+float Ki = 0.0f;  // Duty per lb-second
+float Kd = 0.0f;  // Duty per lb/second
 
-  } else if (reading <= (TW_Adj - PLMI_Adj)) {  // If below padding
-    temp_OCR5B = (TW_Adj - reading) / 10500;     // For constant slow speed -> temp_OCR4B = 20;
-    OCR5B = constrain((uint8_t)temp_OCR5B, 12, 30);
-    digitalWrite(Winch_DIR, LOW);
-    // // Serial.print(OCR5B);
-    // // Serial.print("LOW ");
+const float DERIV_ALPHA = 0.15f;          // Derivative low pass, the load cell is noisy
+const float INTEGRAL_CLAMP_DUTY = 30.0f;  // Anti windup limit on the Ki contribution
 
-  } else {  // If within the padding range, do nothing and brake.
-    temp_OCR5B = 0;
-    OCR5B = temp_OCR5B;
+// The duty band is only 18 counts wide, so all of it has to cover the error range we
+// actually operate in. Effort magnitudes from 0 to EFFORT_FULL_SCALE map linearly onto
+// 12-30, so at Kp = 1.5 the winch saturates near 20 lbs of error.
+const float EFFORT_FULL_SCALE = 30.0f;
+const float EFFORT_DEADZONE = 0.5f;  // Below this we brake instead of creeping at the floor
+
+// At the hard limit the winch creeps toward slack, since a brake would leave the cable
+// parked above the limit with nothing able to bring it down. Time boxed, because a
+// reversed Winch_DIR would make the creep pull harder rather than let off.
+const unsigned long OVERTENSION_RELIEF_MS = 1500;
+
+// PID state
+float measured_lbs = 0.0f;           // Load cell reading converted to lbs
+bool sensorValid = false;            // Cleared when a reading fails the range check
+float integral = 0.0f;               // Accumulated integral term
+float prevError = 0.0f;              // Previous error, for the derivative
+float derivFiltered = 0.0f;          // Filtered derivative
+bool newSample = false;              // Set by mainControl on a fresh load cell read
+unsigned long lastPIDTime = 0;       // millis() of the last PID step
+unsigned long overTensionStart = 0;  // millis() the hard limit was first hit, 0 when clear
+bool overTensionLatched = false;     // Set once relief times out, cleared by resetPID
+
+void winchStop() {  // Duty 0, the Timer5 ISRs then hold Winch_PWM low
+  OCR5B = 0;
+}
+
+void winchRelieve() {  // Creep toward slack at the stall floor
+  digitalWrite(Winch_DIR, HIGH);
+  OCR5B = WINCH_DUTY_MIN;
+}
+
+void resetPID() {  // Wipe the loop's memory whenever the winch changes hands
+  integral = 0.0f;
+  prevError = 0.0f;
+  derivFiltered = 0.0f;
+  newSample = false;
+  lastPIDTime = millis();
+  overTensionStart = 0;
+  overTensionLatched = false;
+}
+
+void driveWinch(float effort) {  // Turns a signed PID effort into a direction & duty
+  float mag = (effort < 0.0f) ? -effort : effort;
+  if (mag < EFFORT_DEADZONE) {
+    winchStop();
+    return;
   }
+
+  if (effort > 0.0f) {
+    digitalWrite(Winch_DIR, LOW);   // Correction direction for too loose
+  } else {
+    digitalWrite(Winch_DIR, HIGH);  // Correction direction for too tight
+  }
+
+  float frac = mag / EFFORT_FULL_SCALE;
+  if (frac > 1.0f) frac = 1.0f;
+  OCR5B = (uint8_t)(WINCH_DUTY_MIN + frac * (WINCH_DUTY_MAX - WINCH_DUTY_MIN) + 0.5f);
+}
+
+void DCTS() {  // Reads the load cell & performs the tension PID on it
+  if (!newSample) {  // Only step on a fresh sample, the HX711 runs near 10 Hz
+    return;
+  }
+  newSample = false;
+
+  unsigned long now = millis();
+  float dt = (float)(now - lastPIDTime) / 1000.0f;
+  lastPIDTime = now;
+  if (dt < 0.005f) dt = 0.005f;  // Guard against a zero span
+  if (dt > 0.25f) dt = 0.25f;    // Guard against a long gap blowing up the I and D terms
+
+  if (!sensorValid) {  // Don't drive on a reading we don't trust
+    winchStop();
+    integral = 0.0f;
+    return;
+  }
+
+  if (measured_lbs >= TENSION_HARD_LIMIT_LBS) {  // Over tension, back off toward slack
+    integral = 0.0f;
+    if (overTensionLatched) {
+      winchStop();
+      return;
+    }
+    if (overTensionStart == 0) {
+      overTensionStart = now;
+    } else if (now - overTensionStart > OVERTENSION_RELIEF_MS) {
+      overTensionLatched = true;  // Relief isn't working, stay stopped until DCTS is cycled
+      winchStop();
+      return;
+    }
+    winchRelieve();
+    return;
+  }
+  overTensionStart = 0;  // Back under the limit
+
+  float error = (float)Target_Weight - measured_lbs;  // Positive means too loose
+
+  if (error >= -TENSION_DEADBAND_LBS && error <= TENSION_DEADBAND_LBS) {  // Close enough, brake
+    winchStop();
+    prevError = error;  // Keep the derivative's history current while braked
+    derivFiltered = 0.0f;
+    return;
+  }
+
+  float pTerm = Kp * error;
+
+  integral += error * dt;
+  float iContribution = Ki * integral;
+  if (iContribution > INTEGRAL_CLAMP_DUTY) {  // Clamp the contribution, then back out the integral
+    iContribution = INTEGRAL_CLAMP_DUTY;
+    if (Ki != 0.0f) integral = INTEGRAL_CLAMP_DUTY / Ki;
+  }
+  if (iContribution < -INTEGRAL_CLAMP_DUTY) {
+    iContribution = -INTEGRAL_CLAMP_DUTY;
+    if (Ki != 0.0f) integral = -INTEGRAL_CLAMP_DUTY / Ki;
+  }
+
+  float rawDeriv = (error - prevError) / dt;
+  derivFiltered = DERIV_ALPHA * rawDeriv + (1.0f - DERIV_ALPHA) * derivFiltered;
+  float dTerm = Kd * derivFiltered;
+
+  prevError = error;
+
+  driveWinch(pTerm + iContribution + dTerm);
 }
 
 void manualCircumControl(int speed, bool dir) { 
@@ -580,6 +704,9 @@ void buttonSel() {  // Switch case for buttons pressed on the remote controller
   switch (rxPkt.buttonID) {
     case '1':
       // Serial.println("1 Pressed.");
+      if (!DCTS_EN) {  // Start the loop clean on every enable
+        resetPID();
+      }
       DCTS_EN = 1;
       break;
 
@@ -587,6 +714,7 @@ void buttonSel() {  // Switch case for buttons pressed on the remote controller
       // Handle 'F'
       // Serial.println("2 Pressed.");
       DCTS_EN = 0;
+      resetPID();
       break;
 
     case '3':
@@ -678,6 +806,7 @@ void setup() {  // Runs all initializing functions
   pinInit();
   loadCellInit();
   PWMTimerInit();
+  resetPID();  // Start the PID's dt clock
 
   printf_begin();
   radio.printPrettyDetails();
@@ -691,6 +820,15 @@ void mainControl() {  // Manages all movement and calls radio RX function
 
   if (scale.is_ready()) {
     reading = scale.read();
+    if (reading >= RAW_MIN_VALID && reading <= RAW_MAX_VALID) {  // Ignore obviously bad readings
+      sensorValid = true;
+      measured_lbs = (float)reading / QUANTA_PER_LB;
+    } else {
+      sensorValid = false;  // Keep the last measured_lbs, the PID brakes on this
+    }
+    if (DCTS_EN) {  // Only latch for the PID, otherwise the flag goes stale in manual mode
+      newSample = true;
+    }
     ackArr[0] = reading / 10430.0;
     ultraSonic();
     ackArr[1] = ultra_dis;
@@ -706,6 +844,7 @@ void mainControl() {  // Manages all movement and calls radio RX function
     if (rxPkt.tensionSet != Target_Weight && rxPkt.tensionSet < 176) {  // If a new tension is detected, set it and make sure its between 10 and 175
       Target_Weight = constrain((uint8_t)rxPkt.tensionSet, 10, 175);
       TW_Adj = Target_Weight * (long)10430;
+      resetPID();  // New setpoint, don't carry a stale integrator into it
       // Serial.print("New tension set: ");
       // Serial.println(Target_Weight);
     }
@@ -735,6 +874,7 @@ void mainControl() {  // Manages all movement and calls radio RX function
     manualTractControl(0, 0);
     manualTensionControl(0, 0);
     manualRadialControl(0, 0);
+    resetPID();  // Link is down, start clean when it comes back
   }
 }
 
