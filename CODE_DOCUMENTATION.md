@@ -580,7 +580,7 @@ So the remote sends a steady stream of joystick packets (buttonID '0') plus extr
 | `TractionWheel2_DIR` | 25 | Traction wheel 2 direction |
 | `TractionWheel3_DIR` | 27 | Traction wheel 3 direction |
 | `Winch_PWM` | 3 | Winch (tension) PWM (via Timer 5) |
-| `Winch_DIR` | 29 | Winch direction (HIGH=retract, LOW=release in DCTS) |
+| `Winch_DIR` | 29 | HIGH = too-tight correction/relief branch; LOW = too-loose correction branch. Physical spool direction is unverified; see Issue #13 |
 | `Circumferential_PWM` | 45 | Circumferential motor PWM (via Timer 4) |
 | `Circumferential_DIR` | 31 | Circumferential motor direction |
 | `Stepper_PWM` | 37 | Stepper step pulse (toggled by Timer 1 ISR) |

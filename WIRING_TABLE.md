@@ -58,6 +58,16 @@ The MD25HV control bank is `GND / 5Vo / PWM / DIR` (per the supplied wiring diag
 > must share a common ground or the PWM/DIR signals have no reference and the
 > winch will behave erratically.
 
+> ⚠️ **Safety-critical direction check before enabling DCTS:** the physical
+> direction of `Winch_DIR` has not been verified. The firmware commands **LOW**
+> to correct low tension and **HIGH** both to correct high tension and to relieve
+> an over-tension fault. Bench-test with the motor unloaded and confirm that LOW
+> increases tension while HIGH releases it. If HIGH tightens the cable, the
+> over-tension relief path will initially worsen the fault. Correct the motor
+> polarity or firmware direction mapping consistently before operation. Manual
+> mode also uses HIGH when `winch_dir == true` and permits duty up to 150,
+> compared with the automatic PID limit of 30.
+
 ---
 
 ## 4. MD25HV Winch Driver — Power / Motor side
