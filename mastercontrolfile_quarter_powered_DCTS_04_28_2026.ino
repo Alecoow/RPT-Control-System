@@ -168,7 +168,7 @@ void pinInit() {  // Initialize every pin we will use according to Arduino Mega 
   digitalWrite(Chainsaw_EN, LOW);  // Fail safe: cutting tool starts disabled
 
   pinMode(Ultrasonic_TRIG, OUTPUT);
-  pinMode(Ultrasonic_ECHO, OUTPUT);
+  pinMode(Ultrasonic_ECHO, INPUT);
   digitalWrite(Ultrasonic_TRIG, LOW);
 }
 
@@ -786,11 +786,9 @@ void printControllerDebug() {  // Prints every joystick value
 
 void ultraSonic() {
   digitalWrite(Ultrasonic_TRIG, LOW);
-  // manDelay(2);
-  // delayMicroseconds(2);
+  delayMicroseconds(2);
   digitalWrite(Ultrasonic_TRIG, HIGH);
-  // delayMicroseconds(10);
-  // manDelay(10);
+  delayMicroseconds(10);
   digitalWrite(Ultrasonic_TRIG, LOW);
   ultra_dur = pulseIn(Ultrasonic_ECHO, HIGH, 30000);
   ultra_dis = ultra_dur * 0.0343 / 2;

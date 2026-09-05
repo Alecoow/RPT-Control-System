@@ -158,7 +158,7 @@ Grouped by purpose (each is fully defined in the [glossary](#8-glossary--master-
 
 **`loadCellDebug()` (L136–148)** — Entirely commented out. A no-op stub left for debugging the raw/converted load readings. (Mentions the conversions: ÷10430 → lbs, ÷22998 → kg.)
 
-**`pinInit()` (L150–173)** — Sets `pinMode(..., OUTPUT)` on every motor PWM pin, every direction pin, the chainsaw enable, and the ultrasonic TRIG. It explicitly drives `Chainsaw_EN` LOW so the cutting tool starts disabled. It also sets `Ultrasonic_ECHO` as OUTPUT then drives TRIG LOW. *(Note: ECHO is configured OUTPUT here even though it's read as an input by `pulseIn`; see [Known Issues](#10-known-issues-quirks-and-things-to-verify).)*
+**`pinInit()` (L150–173)** — Sets `pinMode(..., OUTPUT)` on every motor PWM pin, every direction pin, the chainsaw enable, and the ultrasonic TRIG. It explicitly drives `Chainsaw_EN` LOW so the cutting tool starts disabled. `Ultrasonic_ECHO` is configured as an input and TRIG starts LOW.
 
 **`radioInit()` (L174–184)** — Configures the radio for **receiving** (see [section 2](#2-how-the-two-boards-talk-the-rf-link)): begin, 250 kbps, PA low, channel 76, open reading pipe 1 on the shared address, dynamic payloads, ack payloads, auto-ack on, then `startListening()`.
 
@@ -207,7 +207,7 @@ Grouped by purpose (each is fully defined in the [glossary](#8-glossary--master-
 
 **`printControllerDebug()` (L763–786)** — Calls `radioRX()` then (all Serial prints commented out) would dump every joystick value. Effectively just receives a packet.
 
-**`ultraSonic()` (L788–800)** — Fires the ultrasonic sensor: TRIG low→high→low, then `pulseIn(Ultrasonic_ECHO, HIGH, 30000)` reads the echo width into `ultra_dur` (30 ms timeout). Distance `ultra_dis = ultra_dur * 0.0343 / 2` (speed of sound 343 m/s → 0.0343 cm/µs, halved for round trip). The fixed timing delays around TRIG are commented out.
+**`ultraSonic()`** — Fires the ultrasonic sensor with the HC-SR04 timing sequence: hold TRIG LOW for 2 µs, HIGH for 10 µs, then LOW. `pulseIn(Ultrasonic_ECHO, HIGH, 30000)` reads the echo width into `ultra_dur` with a 30 ms timeout. Distance `ultra_dis = ultra_dur * 0.0343 / 2` (speed of sound 343 m/s → 0.0343 cm/µs, halved for round trip).
 
 **`setup()` (L802–813)** — Runs once: Serial at 115200, `radioInit()`, print "Done Initializing.", `pinInit()`, `loadCellInit()`, `PWMTimerInit()`, then `resetPID()` (starts the PID's `dt` clock, L809), then `printf_begin()` and `radio.printPrettyDetails()` to dump the radio config.
 
@@ -740,7 +740,7 @@ These are factual observations from reading the code — **not** changes. Flagge
 
 3. **Stale pin comments (master).** `DT_PIN`/`SCK_PIN` comments say "D2/D3" but the values are 17/18. Several ISR comments say "Winch" where the pin is actually circumferential.
 
-4. **Ultrasonic ECHO set as OUTPUT (master, `pinInit` L170).** `Ultrasonic_ECHO` is configured `OUTPUT`, yet `ultraSonic()` reads it with `pulseIn(..., HIGH, ...)`. On most boards `pulseIn` still works because the pin is driven by the sensor, but configuring an input pin as OUTPUT is unusual and worth verifying on hardware.
+4. **Ultrasonic electrical and trigger timing are explicit.** `Ultrasonic_ECHO` is configured `INPUT`, avoiding output-driver contention with the sensor. `ultraSonic()` generates the sensor's required 2 µs LOW / 10 µs HIGH trigger sequence before reading the echo.
 
 5. **`isValid()` is a stub** (master L104–107) — always returns `true`, so no packet validation actually happens despite the staging-buffer pattern in `radioRX()`.
 
