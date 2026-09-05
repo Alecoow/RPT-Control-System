@@ -21,8 +21,9 @@
 //    5. Actuator output
 //    6. Serial debug output
 //
-//  NON-BLOCKING: the control loop is timed with millis(). No delay() is used
-//  inside the loop. (delay() appears only once, in load-cell init at startup.)
+//  NON-BLOCKING: the PID advances only when the HX711 supplies a fresh sample,
+//  using the measured sample interval as dt. No delay() is used inside the loop.
+//  (delay() appears only once, in load-cell init at startup.)
 // ============================================================================
 
 #include "HX711.h"
@@ -51,7 +52,7 @@
 //  CALIBRATION CONSTANTS
 // ============================================================================
 
-// Load-cell calibration: how many raw HX711 counts ("quanta") equal one pound.
+// Load-cell calibration: how many tare-corrected HX711 counts ("quanta") equal one pound.
 // Taken from the existing master file (reading / 10430.0 -> lbs).
 // >>> VERIFY against your own calibration before trusting absolute lbs. <<<
 const float QUANTA_PER_LB = 10430.0f;
@@ -92,13 +93,13 @@ float SETPOINT_LBS = 30.0f;
 const float SETPOINT_MIN_LBS = 10.0f;   // matches master file's 10..175 clamp
 const float SETPOINT_MAX_LBS = 175.0f;
 
-// Fixed control period. The PID math assumes a constant dt, so we run the loop
-// on a fixed schedule instead of "as fast as possible".
-const unsigned long CONTROL_PERIOD_MS = 20;   // 50 Hz control loop
-const float DT_S = CONTROL_PERIOD_MS / 1000.0f;
+// PID timing follows the HX711's actual sample cadence (typically 10 or 80 SPS).
+// If samples stop, remove drive instead of continuing on stale feedback.
+const unsigned long SENSOR_TIMEOUT_MS = 250;
 unsigned long lastControlTime = 0;
+unsigned long lastSampleTime = 0;
 
-// Serial print throttle (don't spam every 20 ms)
+// Serial print throttle
 const unsigned long PRINT_PERIOD_MS = 200;    // 5 Hz prints
 unsigned long lastPrintTime = 0;
 
@@ -106,7 +107,7 @@ unsigned long lastPrintTime = 0;
 HX711 scale;
 
 // Measured values
-long  reading       = 0;       // raw load-cell counts (quanta)
+long  reading       = 0;       // tare-corrected load-cell counts (quanta)
 float measured_lbs  = 0.0f;    // converted tension in pounds
 bool  sensorValid   = false;   // set false when a reading is rejected
 
@@ -124,7 +125,7 @@ const float DERIV_ALPHA = 0.15f;
 // saturated output can't keep winding the integral up. Expressed in PWM duty.
 const float INTEGRAL_CLAMP_DUTY = (float)WINCH_DUTY_MAX;
 
-// Sensor validation bounds (raw quanta). A real reading should fall in a sane
+// Sensor validation bounds (tare-corrected quanta). A real reading should fall in a sane
 // window; HX711 returns extreme/min/max-int values when disconnected or saturated.
 // >>> Adjust these to your rig's real min/max once you've logged some data. <<<
 const long RAW_MIN_VALID = -50000L;       // PLACEHOLDER — below this = reject
@@ -143,21 +144,24 @@ bool emergencyStop = false;
 // ============================================================================
 //  SECTION 1 — SENSOR READING
 // ============================================================================
-void readSensor() {
-  if (scale.is_ready()) {
-    long raw = scale.read();
-
-    // Sensor validation: reject obviously bad readings.
-    if (raw >= RAW_MIN_VALID && raw <= RAW_MAX_VALID) {
-      reading      = raw;
-      measured_lbs = (float)raw / QUANTA_PER_LB;
-      sensorValid  = true;
-    } else {
-      // Keep last good 'measured_lbs' but flag invalid so safety can react.
-      sensorValid = false;
-    }
+bool readSensor() {
+  if (!scale.is_ready()) {
+    return false;
   }
-  // If not ready, we simply keep the previous values this cycle (non-blocking).
+
+  long taredReading = (long)scale.get_value(1);
+
+  // Sensor validation: reject obviously bad readings.
+  if (taredReading >= RAW_MIN_VALID && taredReading <= RAW_MAX_VALID) {
+    reading      = taredReading;
+    measured_lbs = (float)taredReading / QUANTA_PER_LB;
+    sensorValid  = true;
+  } else {
+    // Keep last good 'measured_lbs' but flag invalid so safety can react.
+    sensorValid = false;
+  }
+
+  return true;
 }
 
 // ============================================================================
@@ -174,6 +178,7 @@ void handleInput() {
     if (c == 's' || c == 'S') {
       Serial.read();
       emergencyStop = true;
+      winchStop();
       Serial.println(F(">> EMERGENCY STOP latched. Send 'r' to clear."));
     } else if (c == 'r' || c == 'R') {
       Serial.read();
@@ -212,7 +217,7 @@ void handleInput() {
 //  Error convention: error = setpoint - measured.
 //    too loose (measured < setpoint) -> error positive -> tighten. Correct.
 // ============================================================================
-float computePID() {
+float computePID(float dt) {
   float error = SETPOINT_LBS - measured_lbs;
 
   // ---- Proportional ----
@@ -220,14 +225,14 @@ float computePID() {
 
   // ---- Integral (with conditional anti-windup) ----
   // Tentatively accumulate, then clamp the integral *contribution*.
-  integral += error * DT_S;
+  integral += error * dt;
   float iContribution = Ki * integral;
   // Clamp the integral's effect so it can't wind past full output.
   if (iContribution >  INTEGRAL_CLAMP_DUTY) { iContribution =  INTEGRAL_CLAMP_DUTY; integral = (Ki != 0.0f) ?  INTEGRAL_CLAMP_DUTY / Ki : 0.0f; }
   if (iContribution < -INTEGRAL_CLAMP_DUTY) { iContribution = -INTEGRAL_CLAMP_DUTY; integral = (Ki != 0.0f) ? -INTEGRAL_CLAMP_DUTY / Ki : 0.0f; }
 
   // ---- Derivative (on error, low-pass filtered for noisy load cell) ----
-  float rawDeriv = (error - prevError) / DT_S;
+  float rawDeriv = (error - prevError) / dt;
   derivFiltered  = DERIV_ALPHA * rawDeriv + (1.0f - DERIV_ALPHA) * derivFiltered;
   float dTerm    = Kd * derivFiltered;
 
@@ -274,7 +279,7 @@ void driveWinch(float effort) {
 //  SECTION 4 + 5 — SAFETY CHECKS then ACTUATOR
 //  Decides the final winch command, with safety overriding the PID.
 // ============================================================================
-void applyControl() {
+void applyControl(float dt) {
   // --- Safety check 1: emergency latch ---
   if (emergencyStop) { winchStop(); return; }
 
@@ -296,7 +301,7 @@ void applyControl() {
   }
 
   // --- Normal PID actuation ---
-  float effort = computePID();
+  float effort = computePID(dt);
   driveWinch(effort);
 }
 
@@ -307,7 +312,7 @@ void printDebug() {
   Serial.print(F("SET="));     Serial.print(SETPOINT_LBS, 1);
   Serial.print(F("  MEAS="));  Serial.print(measured_lbs, 1);
   Serial.print(F("  ERR="));   Serial.print(SETPOINT_LBS - measured_lbs, 1);
-  Serial.print(F("  RAW="));   Serial.print(reading);
+  Serial.print(F("  TARED=")); Serial.print(reading);
   Serial.print(F("  DUTY="));  Serial.print(OCR5B);
   Serial.print(F("  DIR="));   Serial.print(digitalRead(Winch_DIR) ? F("HIGH(too-tight corr)") : F("LOW(too-loose corr)"));
   Serial.print(F("  I="));     Serial.print(integral, 2);
@@ -366,11 +371,12 @@ void setup() {
   Serial.println(SETPOINT_LBS, 1);
 
   lastControlTime = millis();
-  lastPrintTime   = millis();
+  lastSampleTime  = lastControlTime;
+  lastPrintTime   = lastControlTime;
 }
 
 // ============================================================================
-//  MAIN LOOP  — non-blocking, fixed-rate control via millis()
+//  MAIN LOOP — non-blocking, sample-gated control with measured dt
 // ============================================================================
 void loop() {
   unsigned long now = millis();
@@ -378,12 +384,18 @@ void loop() {
   // Input handling can run every loop (cheap, responsive).
   handleInput();
 
-  // Fixed-rate control cycle.
-  if (now - lastControlTime >= CONTROL_PERIOD_MS) {
-    lastControlTime += CONTROL_PERIOD_MS;   // schedule next (no drift)
-
-    readSensor();      // Section 1
-    applyControl();    // Sections 4 + 3 + 5 (safety -> PID -> actuator)
+  if (readSensor()) {
+    unsigned long sampleTime = millis();
+    float dt = (float)(sampleTime - lastControlTime) / 1000.0f;
+    lastControlTime = sampleTime;
+    lastSampleTime = sampleTime;
+    if (dt < 0.005f) dt = 0.005f;
+    if (dt > 0.25f) dt = 0.25f;
+    applyControl(dt);  // Advance once for this fresh sample
+  } else if (now - lastSampleTime > SENSOR_TIMEOUT_MS) {
+    sensorValid = false;
+    integral = 0.0f;
+    winchStop();  // Never leave the previous duty active on a stalled sensor
   }
 
   // Throttled debug output.
