@@ -52,7 +52,7 @@ Two sensors feed the machine:
 
 | Sensor | Measures | Read by |
 |--------|----------|---------|
-| **HX711 + S-type load cell** | Cable tension (as a raw ADC count called "quanta") | `scale.read()` |
+| **HX711 + S-type load cell** | Cable tension (as a tare-corrected ADC count called "quanta") | `scale.get_value(1)` |
 | **HC-SR04-style ultrasonic** | Radial distance to the trunk (cm) | `ultraSonic()` via `pulseIn` |
 
 The **tension system** is the only closed-loop behavior in the current code. It is named **DCTS** (Dynamic Cable Tension System) and lives in the `DCTS()` function. In the current working tree that function is a **real PID loop** — proportional, integral, and derivative terms running once per fresh load-cell sample with real `millis()` timing — replacing the v1.1 bang-bang algorithm (see [section 5](#5-the-dynamic-cable-tension-system-dcts)). Everything else is open-loop manual control driven directly by the operator's joysticks.
@@ -146,7 +146,7 @@ Grouped by purpose (each is fully defined in the [glossary](#8-glossary--master-
 - **Connection timing:** `lastReceivedTime`, `connectionTimeout = 200 ms`.
 - **Tension setpoint:** `Target_Weight = 30` (lbs, adjustable) — **now the PID setpoint directly, in lbs.** The quanta conversions `TW_Adj = Target_Weight * 10430` and `PLMI_Adj = PLMI * 10430` (L73–74) are **vestigial** after the PID migration: `TW_Adj` is still recomputed on setpoint change (L846) but no control path reads it, and `PLMI_Adj` is unused. The constant **10430 quanta ≈ 1 lb** is the load cell's calibration slope (now the named constant `QUANTA_PER_LB`, L342).
 - **Ultrasonic:** `ultra_dur` (echo pulse width, µs), `ultra_dis` (computed distance, cm).
-- **Load cell / DCTS state:** `scale` (HX711 object), `DCTS_EN` (auto-tension enable flag), `reading` (raw load-cell value), `counter`, `duty_percent`, and three PWM duty temporaries `temp_OCR3B/4B/5B`.
+- **Load cell / DCTS state:** `scale` (HX711 object), `DCTS_EN` (auto-tension enable flag), `reading` (tare-corrected load-cell value), `counter`, `duty_percent`, and three PWM duty temporaries `temp_OCR3B/4B/5B`.
 - **PID loop state:** declared in the PID block itself (L369–378), not in this globals section — `measured_lbs` (feedback in lbs), `sensorValid` (reading validity flag), `integral`, `prevError`, `derivFiltered`, `newSample` (fresh-read latch), `lastPIDTime` (PID `dt` clock), `overTensionStart` / `overTensionLatched` (over-tension relief timer and latch). See [section 5](#5-the-dynamic-cable-tension-system-dcts) and the [glossary](#8-glossary--master-control-file).
 - **Radio:** `radio` object, `address`, `rxPkt` (the live received packet), `tempPkt` (staging packet before validation), `radioSent` (true when a packet has recently arrived), `ackArr[2]` (the 2 bytes sent back to the remote).
 - **Direction dampening (declared but effectively unused):** `currDIR`, `dirCTR`.
@@ -154,7 +154,7 @@ Grouped by purpose (each is fully defined in the [glossary](#8-glossary--master-
 
 ### 4.4 Function-by-function
 
-**`loadCellInit()` (L126–134)** — Starts the HX711 on `DT_PIN`/`SCK_PIN`, sets gain to **32**, waits `delay(500)` for stabilization, then `scale.tare(20)` (averages 20 readings to zero the scale). Uses a blocking `delay()`.
+**`loadCellInit()` (L126–134)** — Starts the HX711 on `DT_PIN`/`SCK_PIN`, sets gain to **32**, waits `delay(500)` for stabilization, then `scale.tare(20)` (averages 20 readings and stores the unloaded offset). Active sensor reads use `scale.get_value(1)`, which subtracts this offset. Uses a blocking `delay()`.
 
 **`loadCellDebug()` (L136–148)** — Entirely commented out. A no-op stub left for debugging the raw/converted load readings. (Mentions the conversions: ÷10430 → lbs, ÷22998 → kg.)
 
@@ -214,7 +214,7 @@ Grouped by purpose (each is fully defined in the [glossary](#8-glossary--master-
 **`mainControl()` (L815–879)** — **The heart of the loop.** Sequence each iteration:
 1. `radioRX()` — get the latest packet.
 2. If `millis() - lastReceivedTime > connectionTimeout` (200 ms) → `radioSent = 0` (connection considered lost).
-3. If `scale.is_ready()` (L821–836): `reading = scale.read()` (L822); range-check it against `RAW_MIN_VALID`–`RAW_MAX_VALID`, setting `sensorValid` and, when valid, converting `measured_lbs = reading / QUANTA_PER_LB` (L823–828); set the PID's fresh-sample latch `newSample = true`, **but only when `DCTS_EN`** (L829–831), so the latch can't go stale during manual control; then `ackArr[0] = reading / 10430.0` (load in lbs), `ultraSonic()`, `ackArr[1] = ultra_dis` (range in cm). *(So both ack bytes are refreshed only when the load cell is ready.)*
+3. If `scale.is_ready()`: read one tare-corrected sample with `scale.get_value(1)`; range-check it against `RAW_MIN_VALID`–`RAW_MAX_VALID`, setting `sensorValid` and, when valid, converting `measured_lbs = reading / QUANTA_PER_LB`; set the PID's fresh-sample latch `newSample = true`, **but only when `DCTS_EN`**, so the latch cannot go stale during manual control; then update the load and range acknowledgements. *(Both ack bytes are refreshed only when the load cell is ready.)*
 4. **If `radioSent` (link is alive):**
    - If `rxPkt.b_EMERGENCY` → `emergency()` (lock down until an explicit clear packet, and disable automatic tension).
    - If `rxPkt.tensionSet != Target_Weight && rxPkt.tensionSet < 176` → adopt the new setpoint: `Target_Weight = constrain(rxPkt.tensionSet, 10, 175)` (L845) — this is now the PID's setpoint, in lbs — recompute `TW_Adj` (L846; vestigial, the PID no longer reads it), and `resetPID()` (L847) so the old integrator isn't carried into the new setpoint.
@@ -361,7 +361,7 @@ void DCTS() {  // Reads the load cell & performs the tension PID on it
 | `TENSION_HARD_LIMIT_LBS` | `185.0f` | At/over this → relieve toward slack, never exceed |
 | `OVERTENSION_RELIEF_MS` | `1500` | How long relief may run before latching the winch off |
 | `WINCH_DUTY_MIN` / `WINCH_DUTY_MAX` | `12` / `30` | Winch duty window (stall floor / quarter-power ceiling) |
-| `RAW_MIN_VALID` / `RAW_MAX_VALID` | `-50000L` / `3000000L` | Raw reading validity window (placeholder — see Issue #12) |
+| `RAW_MIN_VALID` / `RAW_MAX_VALID` | `-50000L` / `3000000L` | Tare-corrected reading validity window (placeholder — see Issue #12) |
 | `QUANTA_PER_LB` | `10430.0f` | Load-cell calibration: quanta per pound |
 
 **As shipped the loop is proportional-only** (`Ki = Kd = 0`). Tune on the bench — ideally first in the standalone sketch `WinchTensionPID_test_06_19_2026.ino` — with the usual progression: P-only until stable, a little I to kill steady-state offset, a little D to damp overshoot. Two things to keep in mind while doing it. First, the deadband branch returns before the integral is touched, so I only has authority on errors *outside* ±2 lbs; if you want tighter steady-state holding, shrink `TENSION_DEADBAND_LBS` rather than reaching for `Ki`. Second, there is no runtime tuning path on the machine — `Kp`/`Ki`/`Kd` are plain globals and nothing reads them from Serial, so each change means a re-flash. The bench sketch does accept live setpoint changes over Serial, which is why it's the better place to tune.
@@ -391,7 +391,7 @@ That version compared raw quanta against `TW_Adj ± PLMI_Adj`, scaled the error 
 | Input | What it is | Set where |
 |-------|-----------|-----------|
 | `newSample` | Latch that a fresh load-cell reading is available | `mainControl` L829–831: set on `scale.is_ready()`, but only while `DCTS_EN` |
-| `reading` | Raw load-cell value (tension feedback), "quanta" | `mainControl` L822: `reading = scale.read()` |
+| `reading` | Tare-corrected load-cell value (tension feedback), "quanta" | `mainControl`: `reading = (long)scale.get_value(1)` |
 | `sensorValid` / `measured_lbs` | Validity flag, and tension in lbs = `reading / QUANTA_PER_LB` (kept at last value when invalid) | `mainControl` L823–828: range check against `RAW_MIN_VALID`–`RAW_MAX_VALID`, then conversion |
 | `Target_Weight` | Setpoint in **lbs** — from the radio pot, adopted clamped to `[10, 175]` (default 30) | `mainControl` L844–845 when a new `tensionSet` arrives |
 | `dt` | Real elapsed time since the last PID step, clamped to `[0.005, 0.25]` s | `DCTS()` L423–427 from `millis()` / `lastPIDTime` |
@@ -433,7 +433,7 @@ Note: `winchStop()` only clears `OCR5B` (duty 0 = motor off); it leaves `Winch_D
 **Replaced:** the bang-bang body of `DCTS()` and everything it implied — the quanta-domain comparison against `TW_Adj ± PLMI_Adj`, the `10500` error divisor (now gone from the code), and the implicit `PLMI` deadband (replaced by the explicit 2 lb `TENSION_DEADBAND_LBS`).
 
 **Kept (the PID reuses these):**
-- `reading` / `scale.read()` — the same feedback signal, now range-checked and converted to lbs.
+- `reading` / `scale.get_value(1)` — the same feedback signal with the startup tare offset applied, then range-checked and converted to lbs.
 - The `Target_Weight` setpoint flow from the radio (10–175 clamp) — now the PID setpoint directly, in lbs.
 - The Timer 5 PWM ISRs and `Winch_PWM` pin (the actuator hardware layer).
 - The `DCTS_EN` vs. `manualTensionControl()` mode switch — the PID slots in exactly where `DCTS()` is called.
@@ -601,7 +601,7 @@ So the remote sends a steady stream of joystick packets (buttonID '0') plus extr
 | `ultra_dis` | `unsigned long` | Computed distance, cm |
 | `scale` | `HX711` | Load-cell ADC object |
 | `DCTS_EN` | `bool` = 0 | **Auto-tension enable.** True → run `DCTS()`; false → manual winch |
-| `reading` | `long` = 0 | Raw load-cell value (tension feedback), "quanta" |
+| `reading` | `long` = 0 | Tare-corrected load-cell value (tension feedback), "quanta" |
 | `counter` | `short int` = 0 | Message-rate slowdown counter (declared; minimal use) |
 | `duty_percent` | `uint8_t` = 0 | Duty-cycle percent (declared; not central to logic) |
 | `temp_OCR3B` | `uint8_t` | Temp duty for traction before constrain → `OCR3B` |
@@ -648,7 +648,7 @@ So the remote sends a steady stream of joystick packets (buttonID '0') plus extr
 | `176` | Upper bound check on incoming `tensionSet` |
 | `2.0` | `TENSION_DEADBAND_LBS` — \|error\| within this (lbs) → PID brakes (L345) |
 | `185.0` | `TENSION_HARD_LIMIT_LBS` — measured tension at/over this (lbs) → PID relieves toward slack, never exceeds (L346) |
-| `-50000 … 3000000` | `RAW_MIN_VALID` / `RAW_MAX_VALID` — raw reading validity window in quanta (placeholder, verify — see Issue #12) (L347–348) |
+| `-50000 … 3000000` | `RAW_MIN_VALID` / `RAW_MAX_VALID` — tare-corrected reading validity window in quanta (placeholder, verify — see Issue #12) (L347–348) |
 | `1.5 / 0.0 / 0.0` | `Kp` / `Ki` / `Kd` — PID gains: PWM duty per lb, per lb·s, per lb/s (placeholders, tune on the bench) (L351–353) |
 | `0.15` | `DERIV_ALPHA` — derivative low-pass alpha (L355) |
 | `30.0` | `INTEGRAL_CLAMP_DUTY` — max magnitude of the I contribution (anti-windup) (L356) |
@@ -760,7 +760,7 @@ These are factual observations from reading the code — **not** changes. Flagge
 
 11. **PID gains are untuned placeholders.** As shipped, `Kp = 1.5` with `Ki = Kd = 0` (L351–353) — the loop is a plain proportional controller with a 2 lb deadband over a 12–30 duty band. Gain units are PWM duty per lb (Kp), per lb·s (Ki), per lb/s (Kd). Tune on the bench, ideally first in the standalone sketch `WinchTensionPID_test_06_19_2026.ino`, which accepts live setpoint changes over Serial; the master file has **no runtime tuning path**, so every gain change there costs a re-flash. When you get to `Ki`, note that the deadband branch returns before the integral is touched, so I has no authority on errors inside ±2 lbs — shrink `TENSION_DEADBAND_LBS` if you need tighter steady-state holding.
 
-12. **The raw-reading validity window is a placeholder.** `RAW_MIN_VALID = -50000L` / `RAW_MAX_VALID = 3000000L` (L347–348) are guessed bounds, not measured load-cell limits. Verify the HX711's actual offset and max-load quanta against your calibration; while a reading is out of range, `sensorValid` goes false, the PID brakes, and `measured_lbs` holds its last value.
+12. **The tare-corrected reading validity window is a placeholder.** `RAW_MIN_VALID = -50000L` / `RAW_MAX_VALID = 3000000L` (L347–348) are guessed bounds, not measured load-cell limits. Verify the HX711's actual post-tare minimum and max-load quanta against your calibration; while a reading is out of range, `sensorValid` goes false, the PID brakes, and `measured_lbs` holds its last value.
 
 13. **Winch direction convention is inherited, not re-verified — and one safety path now depends on it.** `driveWinch()` reproduces the old DCTS pin behavior: `Winch_DIR` LOW = the "too loose" branch (L407), HIGH = the "too tight" branch (L409). The test sketch marks this VERIFY-on-bench: which physical motion (spool-in vs spool-out) each pin state produces depends on the motor driver wiring. This is no longer only a cosmetic question, because `winchRelieve()` (L384–387) drives the HIGH branch *on purpose* to escape an over-tension fault — if HIGH actually tightens, the relief would make the fault worse. That is exactly what `OVERTENSION_RELIEF_MS` and `overTensionLatched` bound, but **confirm the direction on the bench before trusting the hard limit.**
 

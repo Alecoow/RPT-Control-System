@@ -62,7 +62,7 @@ unsigned long ultra_dis;
 // HX711 & load cell variables
 HX711 scale;               // ADC Init
 bool DCTS_EN = 0;          // Enable DCTS
-long reading = 0;          // Raw reading from load cell
+long reading = 0;          // Tare-corrected reading from load cell
 short int counter = 0;     // Counter to slow the rate of message speed
 uint8_t duty_percent = 0;  // Duty cycle percentage
 uint8_t temp_OCR3B = 0;    // OCR3B temporary variable
@@ -134,8 +134,8 @@ void loadCellInit() {            // Initialize load cell scale
 }
 
 void loadCellDebug() {  // Used to read the load cell for debug purposes
-  //reading = scale.read();
-  // Serial.print("\n\nRaw Reading: ");
+  //reading = (long)scale.get_value(1);
+  // Serial.print("\n\nTare-corrected Reading: ");
   // Serial.println(reading);  // Display the digital reading as a decimal
   // Serial.print("\n\nTarget Weight: ");
   // Serial.println(TW_Adj);
@@ -725,7 +725,7 @@ void buttonSel() {  // Switch case for buttons pressed on the remote controller
     case '4':
       // Handle 'R'
       // Serial.println("4 Pressed.");
-      // reading = scale.read();
+      // reading = (long)scale.get_value(1);
       // ackArr[0] = reading / 10430.0;
       break;
 
@@ -816,7 +816,7 @@ void mainControl() {  // Manages all movement and calls radio RX function
   }
 
   if (scale.is_ready()) {
-    reading = scale.read();
+    reading = (long)scale.get_value(1);  // Apply the offset captured by tare()
     if (reading >= RAW_MIN_VALID && reading <= RAW_MAX_VALID) {  // Ignore obviously bad readings
       sensorValid = true;
       measured_lbs = (float)reading / QUANTA_PER_LB;
