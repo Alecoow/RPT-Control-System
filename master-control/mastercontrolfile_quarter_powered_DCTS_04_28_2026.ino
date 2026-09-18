@@ -1,11 +1,8 @@
 // Main Control File on Machine
 // Version 1.1 4-28-2026
-// Changes made: Changed DCTS equations and limits to operate with 1/4th the power. Now allows sending of range data to controller. Allow for greater auto tension values from controller.
-#include <SPI.h>
-#include <nRF24L01.h>
-#include <RF24.h>
+// Changes made: Replaced the wireless controller with controls wired directly
+// to the Arduino Mega and added load-cell logging over Serial.
 #include "HX711.h"
-#include "printf.h"
 
 //////////////////
 // Pin definitions
@@ -44,14 +41,25 @@
 #define Ultrasonic_ECHO 20
 #define Ultrasonic_TRIG 19
 
-// RF pins
-#define CE_PIN 49
-#define CSN_PIN 53
+// Local control inputs. Buttons use INPUT_PULLUP and are active LOW.
+#define Tension_On_Button 22
+#define Tension_Off_Button 24
+#define Tension_Set_Point_Button 26
+#define Tension_Indicated_Button 28
+#define Chainsaw_On_Button 30
+#define Chainsaw_Off_Button 32
+#define Chainsaw_Distance_Set_Point_Button 34
+#define Chainsaw_Distance_Indicated_Button 36
+#define Emergency_Button 38
+
+// Local joystick and setpoint inputs
+#define Left_Joystick_Left_Right_X A0
+#define Left_Joystick_Up_Down_Y A1
+#define Right_Joystick_Left_Right_X A8
+#define Right_Joystick_Up_Down_Y A9
+#define Tension_Potentiometer A4
 
 //////////////////
-
-unsigned long lastReceivedTime = 0;
-const unsigned long connectionTimeout = 200;  // ms
 
 uint8_t Target_Weight = 30;  // Adjustable Target Weight global var
 
@@ -73,55 +81,27 @@ uint8_t temp_OCR5B = 0;    // OCR5B temporary variable
 long int TW_Adj = Target_Weight * (long)10430;
 long int PLMI_Adj = PLMI * (long)10430;
 
-// RF Variables
-
-/* Buttons 1-8
-  bool b_DCTS_ON;
-  bool b_DCTS_OFF;
-  bool b_SET_TENSION;
-  bool b_DISP_TENSION;
-  bool b_CHAIN_ON;
-  bool b_CHAIN_OFF;
-  bool b_CHAIN_DIST_SET;
-  bool b_CHAIN_DIST_DISP;
-*/
-
-// Define the same structure used in the transmitter
-struct ControllerPacket {
-  char buttonID;
-  bool b_EMERGENCY;
-  uint8_t winch_spd;
-  bool winch_dir;
-  uint8_t traction_spd;
-  bool traction_dir;
-  uint8_t circum_spd;
-  bool circum_dir;
-  uint8_t radial_spd;
-  bool radial_dir;
-  uint8_t tensionSet;
+// Local input settings
+const uint8_t LOCAL_BUTTON_PINS[] = {
+  Tension_On_Button,
+  Tension_Off_Button,
+  Tension_Set_Point_Button,
+  Tension_Indicated_Button,
+  Chainsaw_On_Button,
+  Chainsaw_Off_Button,
+  Chainsaw_Distance_Set_Point_Button,
+  Chainsaw_Distance_Indicated_Button
 };
+const uint8_t LOCAL_BUTTON_COUNT = sizeof(LOCAL_BUTTON_PINS) / sizeof(LOCAL_BUTTON_PINS[0]);
+const unsigned long DEBOUNCE_MS = 25;
+bool lastButtonReading[LOCAL_BUTTON_COUNT];
+bool stableButtonState[LOCAL_BUTTON_COUNT];
+unsigned long lastButtonChange[LOCAL_BUTTON_COUNT];
+bool emergencyActive = false;
 
-bool isValid(const ControllerPacket& p) {  // Verifies packet sends valid struct
-  // WIP
-  return true;
-}
-
-// Radio Initialization
-RF24 radio(CE_PIN, CSN_PIN);
-const byte address[5] = { 'T', 'E', 'S', 'T', '1' };  // Must match transmitter
-ControllerPacket rxPkt;
-ControllerPacket tempPkt;
-bool radioSent = 0;
-
-uint8_t ackArr[2];  // Send back tension and distance values
-
-// Dir Speed Dampening
-bool currDIR = 0;
-uint16_t dirCTR = 0;
-
-//RF Debug
-unsigned long startTimer;
-char testchar = '0';  // Debug // Serial.Read val (for controlling with just main control)
+const int JOYSTICK_CENTER = 512;
+const int JOYSTICK_DEADZONE = 100;
+const uint8_t JOYSTICK_OUTPUT_DEADZONE = 15;
 
 void loadCellInit() {            // Initialize load cell scale
   scale.begin(DT_PIN, SCK_PIN);  // Initialize HX711 with DT and SCK pins
@@ -131,20 +111,6 @@ void loadCellInit() {            // Initialize load cell scale
   scale.tare(20);  // Tare the scale
   // Serial.print("Tare offset: ");
   // Serial.println(scale.get_offset());  // Display the tare offset value
-}
-
-void loadCellDebug() {  // Used to read the load cell for debug purposes
-  //reading = (long)scale.get_value(1);
-  // Serial.print("\n\nTare-corrected Reading: ");
-  // Serial.println(reading);  // Display the digital reading as a decimal
-  // Serial.print("\n\nTarget Weight: ");
-  // Serial.println(TW_Adj);
-  // Serial.print("\nWeight (lbs): ");
-  // Serial.println(reading / 10430.0);  // Linear regression slope, every pound is about 10430 quanta, +-30
-  // Serial.print("\nWeight (kg): ");
-  // Serial.println(reading / 22998.0);
-  //manDelay(2000000);
-  //delay(100);
 }
 
 void pinInit() {  // Initialize every pin we will use according to Arduino Mega PCB schematic
@@ -170,32 +136,28 @@ void pinInit() {  // Initialize every pin we will use according to Arduino Mega 
   pinMode(Ultrasonic_TRIG, OUTPUT);
   pinMode(Ultrasonic_ECHO, INPUT);
   digitalWrite(Ultrasonic_TRIG, LOW);
+
+  for (uint8_t i = 0; i < LOCAL_BUTTON_COUNT; i++) {
+    pinMode(LOCAL_BUTTON_PINS[i], INPUT_PULLUP);
+    lastButtonReading[i] = HIGH;
+    stableButtonState[i] = HIGH;
+    lastButtonChange[i] = 0;
+  }
+  pinMode(Emergency_Button, INPUT_PULLUP);
+
+  pinMode(Left_Joystick_Left_Right_X, INPUT);
+  pinMode(Left_Joystick_Up_Down_Y, INPUT);
+  pinMode(Right_Joystick_Left_Right_X, INPUT);
+  pinMode(Right_Joystick_Up_Down_Y, INPUT);
+  pinMode(Tension_Potentiometer, INPUT);
 }
 
-void radioInit() {  // Intializes RF, this is used for both RX and TX
-  radio.begin();
-  radio.setDataRate(RF24_250KBPS);
-  radio.setPALevel(RF24_PA_LOW);
-  radio.setChannel(76);
-  radio.openReadingPipe(1, address);
-  radio.enableDynamicPayloads();
-  radio.enableAckPayload();
-  radio.setAutoAck(true);
-  radio.startListening();
-}
-
-void emergency() {  // Turn off all motors when emergency button is pressed and stay locked in it
-  // Serial.println("EMERGENCY PRESSED");
-  DCTS_EN = 0;  // Require the operator to re-enable automatic tension after recovery
+void stopAllMotion() {
   manualCircumControl(0, 0);
   manualTractControl(0, 0);
   manualTensionControl(0, 0);
   manualRadialControl(0, 0);
   digitalWrite(Chainsaw_EN, LOW);
-  while (rxPkt.b_EMERGENCY) {  // Stay locked until the controller explicitly clears its emergency state
-    radioRX();
-  }
-  resetPID();  // The load cell went unread while locked, don't resume on stale readings
 }
 
 void PWMTimerInit() {  // initializes the PWM for motor speed
@@ -265,19 +227,6 @@ void PWMTimerInit() {  // initializes the PWM for motor speed
   sei();
 }
 
-void radioRX() {  // Simply print what was received.
-  if (radio.available()) {
-    radioSent = 1;
-    lastReceivedTime = millis();
-    radio.read(&tempPkt, sizeof(tempPkt));
-    if (isValid(tempPkt)) {  // optional extra safety
-      rxPkt = tempPkt;       // now update the live struct
-    }
-    radio.writeAckPayload(1, ackArr, sizeof(ackArr));
-    //debugRX();
-  }
-}
-
 void rampMotorSpeed(volatile uint16_t* OCRx, uint8_t currentSpeed, uint8_t targetSpeed, uint8_t rampStep, uint16_t rampDelay_us) {
   if (currentSpeed < targetSpeed) {
     // Ramp Up
@@ -295,35 +244,6 @@ void rampMotorSpeed(volatile uint16_t* OCRx, uint8_t currentSpeed, uint8_t targe
   }
 }
 
-void debugRX() {
-
-  // Now print the rest of the packet values
-  // Serial.print(F("Button Pressed: "));
-  // Serial.println(rxPkt.buttonID);
-  // Serial.print(F("Emergency Status: "));
-  // Serial.println(rxPkt.b_EMERGENCY);
-
-  // Serial.print(F("Winch Speed: "));
-  // Serial.println(rxPkt.winch_spd);
-  // Serial.print(F("Winch Direction: "));
-  // Serial.println(rxPkt.winch_dir);
-
-  // Serial.print(F("Traction Speed: "));
-  // Serial.println(rxPkt.traction_spd);
-  // Serial.print(F("Traction Direction: "));
-  // Serial.println(rxPkt.traction_dir);
-
-  // Serial.print(F("Circumferential Speed: "));
-  // Serial.println(rxPkt.circum_spd);
-  // Serial.print(F("Circumferential Direction: "));
-  // Serial.println(rxPkt.circum_dir);
-
-  // Serial.print(F("Radial Speed: "));
-  // Serial.println(rxPkt.radial_spd);
-  // Serial.print(F("Radial Direction: "));
-  // Serial.println(rxPkt.radial_dir);
-}
-
 void manDelay(int del) {
   int i = 0;
   while (i < del) {
@@ -333,8 +253,8 @@ void manDelay(int del) {
 
 //////////////////
 // Winch Tension PID
-// Feedback is the load cell converted to lbs, the setpoint is Target_Weight from the
-// controller pot, and the signed PID effort becomes a winch duty (OCR5B) plus a
+// Feedback is the load cell converted to lbs, the setpoint is Target_Weight captured
+// from the local potentiometer, and the signed PID effort becomes a winch duty (OCR5B) plus a
 // direction on Winch_DIR. Steps once per fresh load cell sample, using the real
 // elapsed time as dt.
 
@@ -375,6 +295,15 @@ bool newSample = false;              // Set by mainControl on a fresh load cell 
 unsigned long lastPIDTime = 0;       // millis() of the last PID step
 unsigned long overTensionStart = 0;  // millis() the hard limit was first hit, 0 when clear
 bool overTensionLatched = false;     // Set once relief times out, cleared by resetPID
+
+void loadCellDebug() {
+  Serial.print(F("LOAD_CELL raw="));
+  Serial.print(reading);
+  Serial.print(F(" lbs="));
+  Serial.print((float)reading / QUANTA_PER_LB, 2);
+  Serial.print(F(" valid="));
+  Serial.println(sensorValid ? F("Y") : F("N"));
+}
 
 void winchStop() {  // Duty 0, the Timer5 ISRs then hold Winch_PWM low
   OCR5B = 0;
@@ -552,236 +481,93 @@ void manualRadialControl(bool on, bool dir) {
   }
 }
 
-void manualController() {
-  switch (testchar) {
-    case 'E':  // Emergency
-      // Handle 'E'
-      // Serial.println("E Pressed.");
-      emergency();
-      break;
-
-    case 'O':  // Stop traction wheels
-      // Handle 'E'
-      // Serial.println("O Pressed.");
-      manualTractControl(50, 1);
-      break;
-
-    case 'P':  // Up on traction wheels
-      // Handle 'E'
-      // Serial.println("P Pressed.");
-      manualTractControl(50, 0);
-      break;
-
-    case 'I':
-      // Handle 'E'
-      // Serial.println("I Pressed.");
-      manualTractControl(0, 0);
-      break;
-
-    case 'F':
-      // Handle 'F'
-      // Serial.println("F Pressed.");
-      //manualTractControl(50, 1);
-      //TIMSK5 |= (1 << OCIE5A);
-      manualTensionControl(100, 1);
-      //manualCircumControl(100, 1);
-      //manualRadialControl(1, 1);
-      break;
-
-    case 'R':
-      // Handle 'R'
-      // Serial.println("R Pressed.");
-      //manualTractControl(50, 0);
-      //TIMSK5 |= (1 << OCIE5A);
-      manualTensionControl(100, 0);
-      //manualCircumControl(100, 0);
-      //manualRadialControl(1, 0);
-      break;
-
-    case 'Q':
-      // Handle 'R'
-      // Serial.println("Q Pressed.");
-      // manualTractControl(50, 0);
-      //manualTensionControl(100, 0);
-      //manualCircumControl(100, 0);
-      manualRadialControl(1, 0);
-      break;
-
-    case 'W':
-      // Handle 'R'
-      // Serial.println("W Pressed.");
-      // manualTractControl(50, 0);
-      //manualTensionControl(100, 0);
-      //manualCircumControl(100, 0);
-      manualRadialControl(1, 1);
-      break;
-
-    case 'T':
-      // Handle 'R'
-      // Serial.println("T Pressed.");
-      // manualTractControl(50, 0);
-      //manualTensionControl(100, 0);
-      manualCircumControl(100, 0);
-      //manualRadialControl(1, 0);
-      break;
-
-    case 'Y':
-      // Handle 'R'
-      // Serial.println("Y Pressed.");
-      // manualTractControl(50, 0);
-      //manualTensionControl(100, 0);
-      manualCircumControl(100, 1);
-      //manualRadialControl(1, 0);
-      break;
-
-    case 'S':
-      // Handle 'R'
-      // Serial.println("S Pressed.");
-      //TIMSK5 &= ~(1 << OCIE5A);
-      manualTractControl(0, 0);
-      manualTensionControl(0, 0);
-      manualTractControl(0, 0);
-      manualCircumControl(0, 0);
-      manualRadialControl(0, 0);
-      break;
-
-    case 'C':
-      // Handle 'E'
-      // Serial.println("E Pressed.");
-      digitalWrite(Chainsaw_EN, HIGH);
-      //DCTS_EN = 1;
-      break;
-
-    case 'N':
-      // Handle 'E'
-      // Serial.println("E Pressed.");
-      //DCTS_EN = 0;
-      digitalWrite(Chainsaw_EN, LOW);
-      break;
-
-    case 'Z':
-      // Handle 'E'
-      // Serial.println("E Pressed.");
-      //DCTS_EN = 0;
-      //TIMSK4 &= ~(1 << OCIE4A);
-      //TIMSK5 &= ~(1 << OCIE5A);
-      break;
-
-    case 'X':
-      // Handle 'E'
-      // Serial.println("E Pressed.");
-      //DCTS_EN = 0;
-      //TIMSK4 |= (1 << OCIE4A);
-      //TIMSK5 |= (1 << OCIE5A);
-      break;
-
-    default:
-      // Do nothing for any other character
-      break;
+bool buttonPressed(uint8_t index) {
+  bool currentReading = digitalRead(LOCAL_BUTTON_PINS[index]);
+  if (currentReading != lastButtonReading[index]) {
+    lastButtonChange[index] = millis();
+    lastButtonReading[index] = currentReading;
   }
 
-
-  /*if ( Serial.available() > 0) {  // Read serial values from the serial monitor on debug laptop
-    testchar = toUpperCase(// Serial.read());
-  }*/
+  if ((millis() - lastButtonChange[index]) >= DEBOUNCE_MS &&
+      currentReading != stableButtonState[index]) {
+    stableButtonState[index] = currentReading;
+    return currentReading == LOW;
+  }
+  return false;
 }
 
-
-/*void readDebug() {  // Read multiple digit values from serial monitor to send mock values for load/distance vals
-  if (Serial.available() > 0) {
-    String s = Serial.readStringUntil('\n');  // read up to newline
-    s.trim();                                 // strip CR/LF
-    int val = s.toInt();                      // convert "203" → 203
-    ackArr[0] = val;                          // ‘5’ → 5
-    radio.writeAckPayload(1, ackArr, sizeof(ackArr));
-    // Serial.print("ACK set to: ");
-    // Serial.println(ackArr[0]);
+uint8_t joystickSpeed(int value) {
+  int distanceFromCenter = abs(value - JOYSTICK_CENTER);
+  if (distanceFromCenter <= JOYSTICK_DEADZONE) {
+    return 0;
   }
-}*/
 
-void buttonSel() {  // Switch case for buttons pressed on the remote controller
-  switch (rxPkt.buttonID) {
-    case '1':
-      // Serial.println("1 Pressed.");
-      if (!DCTS_EN) {  // Start the loop clean on every enable
-        resetPID();
-      }
-      DCTS_EN = 1;
-      break;
+  long speed = map(distanceFromCenter, JOYSTICK_DEADZONE, JOYSTICK_CENTER,
+                   0, 193);
+  speed = constrain(speed, 0, 193);
+  return speed < JOYSTICK_OUTPUT_DEADZONE ? 0 : (uint8_t)speed;
+}
 
-    case '2':
-      // Handle 'F'
-      // Serial.println("2 Pressed.");
-      DCTS_EN = 0;
+void handleLocalButtons() {
+  if (buttonPressed(0)) {
+    if (!DCTS_EN) {
+      winchStop();
       resetPID();
-      break;
-
-    case '3':
-      // Handle 'R'
-      // Serial.println("3 Pressed.");
-
-      break;
-
-    case '4':
-      // Handle 'R'
-      // Serial.println("4 Pressed.");
-      // reading = (long)scale.get_value(1);
-      // ackArr[0] = reading / 10430.0;
-      break;
-
-    case '5':
-      // Handle 'E'
-      // Serial.println("5 Pressed.");
-      digitalWrite(Chainsaw_EN, HIGH);
-      break;
-
-    case '6':
-      // Handle 'E'
-      // Serial.println("6 Pressed.");
-      digitalWrite(Chainsaw_EN, LOW);
-      break;
-
-    case '7':
-      // Handle 'E'
-      // Serial.println("7 Pressed.");
-
-      break;
-
-    case '8':
-      // Handle 'E'
-      // Serial.println("8 Pressed.");
-
-      break;
-
-    default:
-      // Do nothing for any other character
-      break;
+    }
+    DCTS_EN = true;
+    Serial.println(F("DCTS enabled"));
+  }
+  if (buttonPressed(1)) {
+    DCTS_EN = false;
+    resetPID();
+    winchStop();
+    Serial.println(F("DCTS disabled"));
+  }
+  if (buttonPressed(2)) {
+    Target_Weight = (uint8_t)map(analogRead(Tension_Potentiometer),
+                                 0, 1023, 10, 175);
+    TW_Adj = Target_Weight * (long)10430;
+    resetPID();
+    Serial.print(F("Target tension set to "));
+    Serial.print(Target_Weight);
+    Serial.println(F(" lbs"));
+  }
+  if (buttonPressed(3)) {
+    loadCellDebug();
+  }
+  if (buttonPressed(4)) {
+    digitalWrite(Chainsaw_EN, HIGH);
+    Serial.println(F("Chainsaw enabled"));
+  }
+  if (buttonPressed(5)) {
+    digitalWrite(Chainsaw_EN, LOW);
+    Serial.println(F("Chainsaw disabled"));
+  }
+  if (buttonPressed(6)) {
+    Serial.println(F("Distance set-point input is not used by this controller"));
+  }
+  if (buttonPressed(7)) {
+    Serial.print(F("DISTANCE cm="));
+    Serial.println(ultra_dis);
   }
 }
 
-void printControllerDebug() {  // Prints every joystick value
-  radioRX();
-  // Serial.print(F("Winch Speed: "));
-  // Serial.println(rxPkt.winch_spd);
-  // Serial.print(F("Winch Direction: "));
-  // Serial.println(rxPkt.winch_dir ? "Forward" : "Reverse");
+void handleLocalJoysticks() {
+  int winchValue = analogRead(Left_Joystick_Left_Right_X);
+  int tractionValue = analogRead(Left_Joystick_Up_Down_Y);
+  int circumValue = analogRead(Right_Joystick_Left_Right_X);
+  int radialValue = analogRead(Right_Joystick_Up_Down_Y);
 
-  // Serial.print(F("Traction Speed: "));
-  // Serial.println(rxPkt.traction_spd);
-  // Serial.print(F("Traction Direction: "));
-  // Serial.println(rxPkt.traction_dir ? "Forward" : "Reverse");
-
-  // Serial.print(F("Circumferential Speed: "));
-  // Serial.println(rxPkt.circum_spd);
-  // Serial.print(F("Circumferential Direction: "));
-  // Serial.println(rxPkt.circum_dir ? "Forward" : "Reverse");
-
-  // Serial.print(F("Radial Speed: "));
-  // Serial.println(rxPkt.radial_spd);
-  // Serial.print(F("Radial Direction: "));
-  // Serial.println(rxPkt.radial_dir ? "Forward" : "Reverse");
-
-  // Serial.println();  // Blank line for readability
+  if (!DCTS_EN) {
+    manualTensionControl(joystickSpeed(winchValue),
+                         winchValue < JOYSTICK_CENTER);
+  }
+  manualTractControl(joystickSpeed(tractionValue),
+                     tractionValue < JOYSTICK_CENTER);
+  manualCircumControl(joystickSpeed(circumValue),
+                      circumValue < JOYSTICK_CENTER);
+  manualRadialControl(joystickSpeed(radialValue) > 20,
+                      radialValue < JOYSTICK_CENTER);
 }
 
 void ultraSonic() {
@@ -798,22 +584,36 @@ void ultraSonic() {
 
 void setup() {  // Runs all initializing functions
   Serial.begin(115200);
-  radioInit();
-  Serial.println("Done Initializing.");
   pinInit();
   loadCellInit();
   PWMTimerInit();
   resetPID();  // Start the PID's dt clock
 
-  printf_begin();
-  radio.printPrettyDetails();
+  Serial.println(F("Local wired controller initialized."));
+  Serial.println(F("Load-cell format: LOAD_CELL raw=<counts> lbs=<weight> valid=<Y/N>"));
 }
 
-void mainControl() {  // Manages all movement and calls radio RX function
-  radioRX();
-  if (millis() - lastReceivedTime > connectionTimeout) {
-    radioSent = 0;  // Lost connection
+void mainControl() {
+  bool emergencyPressed = digitalRead(Emergency_Button) == LOW;
+  if (emergencyPressed) {
+    if (!emergencyActive) {
+      emergencyActive = true;
+      DCTS_EN = false;  // Require the operator to re-enable DCTS after recovery
+      resetPID();
+      Serial.println(F("EMERGENCY STOP active"));
+    }
+    stopAllMotion();
+    return;
   }
+
+  if (emergencyActive) {
+    emergencyActive = false;
+    resetPID();
+    Serial.println(F("Emergency stop released; DCTS remains disabled"));
+  }
+
+  handleLocalButtons();
+  handleLocalJoysticks();
 
   if (scale.is_ready()) {
     reading = (long)scale.get_value(1);  // Apply the offset captured by tare()
@@ -826,66 +626,17 @@ void mainControl() {  // Manages all movement and calls radio RX function
     if (DCTS_EN) {  // Only latch for the PID, otherwise the flag goes stale in manual mode
       newSample = true;
     }
-    ackArr[0] = reading / 10430.0;
     ultraSonic();
-    ackArr[1] = ultra_dis;
-    //// Serial.println(ackArr[0]);
+    loadCellDebug();
   }
-  // Get reading
-  //// Serial.println(radioSent);
-  if (radioSent) {  // Only do this stuff if packets are being sent radioSent
 
-    if (rxPkt.b_EMERGENCY) {  // If emergency button is pressed at all
-      emergency();
-    }
-    if (rxPkt.tensionSet != Target_Weight && rxPkt.tensionSet < 176) {  // If a new tension is detected, set it and make sure its between 10 and 175
-      Target_Weight = constrain((uint8_t)rxPkt.tensionSet, 10, 175);
-      TW_Adj = Target_Weight * (long)10430;
-      resetPID();  // New setpoint, don't carry a stale integrator into it
-      // Serial.print("New tension set: ");
-      // Serial.println(Target_Weight);
-    }
-    if (DCTS_EN) {  // If the DCTS is enabled
-      DCTS();
-    } else {  // If DCTS isn't enabled, allow manual control
-      manualTensionControl(rxPkt.winch_spd, rxPkt.winch_dir);
-    }
-
-    buttonSel();  // Button logic
-
-    // Manual control of motors
-    manualCircumControl(rxPkt.circum_spd, rxPkt.circum_dir);
-    manualTractControl(rxPkt.traction_spd, rxPkt.traction_dir);
-    manualRadialControl(((rxPkt.radial_spd > 20)), rxPkt.radial_dir);
-
-    // if (rxPkt.winch_spd < rxPkt.circum_spd) {  // If DCTS isn't enabled, allow manual control
-    //   manualCircumControl(rxPkt.circum_spd, rxPkt.circum_dir);
-    // }
-    // if (rxPkt.traction_spd > rxPkt.radial_spd) {  // If DCTS isn't enabled, allow manual control
-    //   manualTractControl(rxPkt.traction_spd, rxPkt.traction_dir);
-    // } else {
-    //   manualRadialControl(((rxPkt.radial_spd > 20)), rxPkt.radial_dir);
-    // }
-  } else {
-    manualCircumControl(0, 0);
-    manualTractControl(0, 0);
-    manualTensionControl(0, 0);
-    manualRadialControl(0, 0);
-    digitalWrite(Chainsaw_EN, LOW);
-    resetPID();  // Link is down, start clean when it comes back
+  if (DCTS_EN) {
+    DCTS();
   }
 }
 
 void loop() {
-  //manualController();
-  //loadCellDebug();
-  // if (DCTS_EN) {
-  //   DCTS();
-  // }
-  //printControllerDebug();
-  //readDebug();
-  //ultraSonic();
-  mainControl();  // This is the only function that needs to be in here
+  mainControl();
 }
 
 
