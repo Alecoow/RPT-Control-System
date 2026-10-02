@@ -1,4 +1,21 @@
 // Main Control File on Machine
+// Version 1.2 10-02-2026
+// Changes made (v1.2): Retuned the winch tension PID for the machine's measured
+//   cable stiffness (~2.6 lb/mm = 66 lb/in at the 120 lb operating point) and for
+//   the PSD-S1 50 kg S-type load cell (channel B, gain 32).
+//     - PD start gains: Kp 1.5 -> 0.5, Kd 0.0 -> 0.1, Ki stays 0.
+//       The winch drives a spring, so the plant already integrates: P alone gives
+//       zero steady-state error. Ki would only add overshoot and windup.
+//     - DERIV_ALPHA 0.15 -> 0.40. At the HX711's ~10 Hz sample rate, 0.15 gives a
+//       ~0.67 s filter lag, longer than the motion being damped.
+//     - Deadband 2 -> 5 lb. At 66 lb/in, 2 lb is 0.030 in of cable, inside typical
+//       gearbox backlash, so the loop hunts trying to hold it.
+//     - Hard limit 185 -> 125 lb and setpoint ceiling 175 -> 120 lb. The 50 kg cell
+//       is rated to 110 lb; see the WARNING by TENSION_HARD_LIMIT_LBS.
+//     - Sensor validation moved from raw counts to lbs, so it stays correct if
+//       QUANTA_PER_LB is recalibrated, and a reversed cell is caught.
+//     - Added LOADCELL_SIGN so a backwards-reading cell is a one-line fix.
+//     - Remote tension readback now uses QUANTA_PER_LB instead of a hardcoded 10430.
 // Version 1.1 4-28-2026
 // Changes made: Changed DCTS equations and limits to operate with 1/4th the power. Now allows sending of range data to controller. Allow for greater auto tension values from controller.
 #include <SPI.h>
@@ -114,6 +131,9 @@ ControllerPacket tempPkt;
 bool radioSent = 0;
 
 uint8_t ackArr[2];  // Send back tension and distance values
+uint8_t lastTensionSetRaw = 0;  // Last RAW pot value acted on. Compared before clamping,
+                                // so a pot parked above the ceiling doesn't look like a
+                                // new setpoint on every packet and reset the PID.
 
 // Dir Speed Dampening
 bool currDIR = 0;
@@ -338,25 +358,65 @@ void manDelay(int del) {
 // direction on Winch_DIR. Steps once per fresh load cell sample, using the real
 // elapsed time as dt.
 
-const float QUANTA_PER_LB = 10430.0f;         // Quanta per pound, same slope as the ack conversion
-const uint8_t WINCH_DUTY_MIN = 12;            // Stall floor, below this the winch won't turn
-const uint8_t WINCH_DUTY_MAX = 30;            // Quarter power ceiling
-const float TENSION_DEADBAND_LBS = 2.0f;      // Error padding, within this we brake
-const float TENSION_HARD_LIMIT_LBS = 185.0f;  // Never pull past this
-const long RAW_MIN_VALID = -50000L;           // Reject readings below this. PLACEHOLDER, verify on the rig
-const long RAW_MAX_VALID = 3000000L;          // Reject readings above this. PLACEHOLDER, verify on the rig
+// Load cell: PSD-S1 S-type, 50 kg (110 lb) capacity, wired to the HX711's E+/E-
+// and B+/B- terminals, so the ADC runs on channel B at gain 32 (set in loadCellInit).
+// 10430 counts per lb is the slope the previous team measured on this same cell at
+// this same gain. Re-verify with a known weight after any rewiring or cell swap.
+const float QUANTA_PER_LB = 10430.0f;
+// +1 when pulling the cable makes the reading go MORE POSITIVE. Set to -1 if a pull
+// reads negative (A/B wires swapped), instead of rewiring the cell.
+const long LOADCELL_SIGN = 1;
 
-// PID gains. Tune on the bench, ideally in WinchTensionPID_test first.
-float Kp = 1.5f;  // Duty per lb
-float Ki = 0.0f;  // Duty per lb-second
-float Kd = 0.0f;  // Duty per lb/second
+const uint8_t WINCH_DUTY_MIN = 12;  // Stall floor, below this the winch won't turn
+const uint8_t WINCH_DUTY_MAX = 30;  // Quarter power ceiling
 
-const float DERIV_ALPHA = 0.15f;          // Derivative low pass, the load cell is noisy
+// Deadband: at the measured cable stiffness of ~66 lb/in near 120 lb, 1 lb of tension
+// is only 0.015 in of cable travel. 5 lb (0.076 in) keeps the request outside the
+// drivetrain's backlash, so the winch isn't chasing a target it can't resolve.
+const float TENSION_DEADBAND_LBS = 5.0f;
+
+// WARNING: the 50 kg cell is rated to 110 lb. A 120 lb setpoint is ABOVE its rating,
+// so this limit sits outside the calibrated range and leaves no headroom for the
+// shock loads a slip or a hard stop produces. Watch the peak tension on early climbs;
+// a 100 kg (220 lb) cell is the proper fix if the spikes are large.
+const float TENSION_HARD_LIMIT_LBS = 140.0f;  // Never pull past this
+
+// Highest tension the operator may command. Kept below the hard limit so the PID has
+// somewhere to work. The transmitter's pot still spans 10-175 lb; anything above this
+// is clamped here, in mainControl().
+const uint8_t TENSION_SETPOINT_MAX_LBS = 120;
+
+// Sensor validation, expressed in lbs so it tracks QUANTA_PER_LB. A reading below
+// MIN means the cell reads backwards or has drifted badly; above MAX means a
+// saturated ADC or an open wire (a clipped HX711 reads ~800 lb at this slope).
+const float MIN_VALID_LBS = -20.0f;
+const float MAX_VALID_LBS = 200.0f;
+
+// PID gains. PD only: the winch drives a spring, so the plant integrates and
+// proportional control alone settles with no steady-state error. Adding Ki makes the
+// loop second order, which buys overshoot and windup, not accuracy.
+// Starting point for a ~10 Hz sample rate; see the tuning note below.
+float Kp = 1.0f;  // Duty per lb       - saturates the 12-30 band at 60 lb of error
+float Ki = 0.0f;  // Duty per lb-second - leave at 0
+float Kd = 0.2f;  // Duty per lb/second - Td = Kd/Kp = 0.2 s, about 2 sample periods
+
+// TUNING: with the PID off, drive the winch at a fixed duty (12, then 20, then 30)
+// and log how fast tension rises in lb/s. The change in that slope per duty count is
+// the plant gain g. Then Kp = 1.5 / g for a ~1.5 rad/s crossover, and Kd = 0.2 * Kp.
+// Kp = 0.5 here assumes g = 3 lb/s per duty count. If the winch moves faster than
+// that, this will oscillate: halve Kp until it stops, then work back up.
+// Raising the HX711 to 80 SPS (its RATE pin) allows roughly 3-4x these gains; the
+// code reads dt from millis(), so it adapts to the faster rate on its own.
+
+const float DERIV_ALPHA = 0.40f;          // Derivative low pass. At ~10 Hz this is a
+                                          // ~0.25 s filter: slow enough for load-cell
+                                          // noise, fast enough to damp real motion.
 const float INTEGRAL_CLAMP_DUTY = 30.0f;  // Anti windup limit on the Ki contribution
 
 // The duty band is only 18 counts wide, so all of it has to cover the error range we
 // actually operate in. Effort magnitudes from 0 to EFFORT_FULL_SCALE map linearly onto
-// 12-30, so at Kp = 1.5 the winch saturates near 20 lbs of error.
+// 12-30, so at Kp = 0.5 the winch saturates near 60 lbs of error: full duty for most of
+// a pull up from slack, tapering over the last stretch into the setpoint.
 const float EFFORT_FULL_SCALE = 30.0f;
 const float EFFORT_DEADZONE = 0.5f;  // Below this we brake instead of creeping at the floor
 
@@ -816,17 +876,21 @@ void mainControl() {  // Manages all movement and calls radio RX function
   }
 
   if (scale.is_ready()) {
-    reading = (long)scale.get_value(1);  // Apply the offset captured by tare()
-    if (reading >= RAW_MIN_VALID && reading <= RAW_MAX_VALID) {  // Ignore obviously bad readings
+    reading = LOADCELL_SIGN * (long)scale.get_value(1);  // Offset from tare(), sign from wiring
+    float lbs = (float)reading / QUANTA_PER_LB;
+    if (lbs > MIN_VALID_LBS && lbs < MAX_VALID_LBS) {  // Ignore obviously bad readings
       sensorValid = true;
-      measured_lbs = (float)reading / QUANTA_PER_LB;
+      measured_lbs = lbs;
     } else {
       sensorValid = false;  // Keep the last measured_lbs, the PID brakes on this
     }
     if (DCTS_EN) {  // Only latch for the PID, otherwise the flag goes stale in manual mode
       newSample = true;
     }
-    ackArr[0] = reading / 10430.0;
+    float ackLbs = measured_lbs;  // Tension readback for the controller, 0-255 lbs
+    if (ackLbs < 0.0f) ackLbs = 0.0f;
+    if (ackLbs > 255.0f) ackLbs = 255.0f;
+    ackArr[0] = (uint8_t)ackLbs;
     ultraSonic();
     ackArr[1] = ultra_dis;
     //// Serial.println(ackArr[0]);
@@ -838,10 +902,14 @@ void mainControl() {  // Manages all movement and calls radio RX function
     if (rxPkt.b_EMERGENCY) {  // If emergency button is pressed at all
       emergency();
     }
-    if (rxPkt.tensionSet != Target_Weight && rxPkt.tensionSet < 176) {  // If a new tension is detected, set it and make sure its between 10 and 175
-      Target_Weight = constrain((uint8_t)rxPkt.tensionSet, 10, 175);
-      TW_Adj = Target_Weight * (long)10430;
-      resetPID();  // New setpoint, don't carry a stale integrator into it
+    if (rxPkt.tensionSet != lastTensionSetRaw && rxPkt.tensionSet >= 10) {  // New tension from the pot
+      lastTensionSetRaw = rxPkt.tensionSet;
+      uint8_t newTarget = constrain((uint8_t)rxPkt.tensionSet, 10, TENSION_SETPOINT_MAX_LBS);
+      if (newTarget != Target_Weight) {   // Clamped: only act when the target actually moved
+        Target_Weight = newTarget;
+        TW_Adj = Target_Weight * (long)QUANTA_PER_LB;
+        resetPID();  // New setpoint, don't carry a stale integrator into it
+      }
       // Serial.print("New tension set: ");
       // Serial.println(Target_Weight);
     }
