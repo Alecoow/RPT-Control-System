@@ -1,7 +1,6 @@
-// Wireless Controller File
-// Version 1.1 4-28-2026
-// Changes made: Allows for tension to be set to an upper limit of 175 lbs when using pot in dcts.
-// Include Libraries
+// Wireless controller file.
+// Reads the buttons, joysticks, and knob, sends them to the machine, and shows the
+// machine's load and range on the LCD.
 #include <SPI.h>
 #include <nRF24L01.h>
 #include <RF24.h>
@@ -9,93 +8,90 @@
 #include <LiquidCrystal_I2C.h>
 #include "printf.h"
 
-// Defines Buttons
-#define Tension_On_Button 23                   // Left Side Button 1 (Pin 23)
-#define Tension_Off_Button 25                  // Left Side Button 2 (Pin 25)
-#define Tension_Set_Point_Button 27            // Left Side Button 3 (Pin 27)
-#define Tension_Indicated_Button 29            // Left Side Button 4 (Pin 29)
-#define Chainsaw_On_Button 24                  // Right Side Button 5 (Pin 24)
-#define Chainsaw_Off_Button 26                 // Right Side Button 6 (Pin 26)
-#define Chainsaw_Distance_Set_Point_Button 28  // Right Side Button 7 (Pin 28)
-#define Chainsaw_Distance_Indicated_Button 30  // Right Side Button 8 (Pin 30)
-#define Emergency_Button 22                    // Button 9 (Pin 22)
+// Buttons
+#define Tension_On_Button 23                   // Button 1, automatic tension on
+#define Tension_Off_Button 25                  // Button 2, automatic tension off
+#define Tension_Set_Point_Button 27            // Button 3, open Set Load
+#define Tension_Indicated_Button 29            // Button 4, confirm Set Load
+#define Chainsaw_On_Button 24                  // Button 5, chainsaw on
+#define Chainsaw_Off_Button 26                 // Button 6, chainsaw off
+#define Chainsaw_Distance_Set_Point_Button 28  // Button 7, open Set Range
+#define Chainsaw_Distance_Indicated_Button 30  // Button 8, confirm Set Range, also e-stop recovery
+#define Emergency_Button 22                    // Button 9, emergency stop
 
 // Define Joysticks
 #define Left_Joystick_Left_Right_X A0   // Left Joystick Horizontal (X) Direction For Tension Loose/Tighten (Pin A0)
 #define Left_Joystick_Up_Down_Y A1      // Left Joystick Vertical (Y) Direction For Elevator Climbing/Descending (Pin A1)
 #define Right_Joystick_Left_Right_X A8  // Right Joystick Horizontal (X) Direction For Circumferential Position (Pin A8)
 #define Right_Joystick_Up_Down_Y A9    // Right Joystick Vertical (Y) Direction For Chainsaw In/Out (Pin A10)
-#define Potentiometer A4
+#define Potentiometer A4                // Knob for Set Load and Set Range
 
-// Define NRF24
-#define CE_PIN 49   // Chip Enable pin (activates TX or RX mode)
-#define CSN_PIN 53  // Chip Select Not pin (SPI communication control)
+// NRF24
+#define CE_PIN 49
+#define CSN_PIN 53
 
-// Define LCD Screen
-#define SDA_PIN 20  // I2C Data Line Pin (Not used in the code, initialized for clarification)
-#define SCL_PIN 21  // I2C Clock Line Pin (Not used in the code, initialized for clarification)
+// LCD, for reference only, the I2C library uses these pins itself
+#define SDA_PIN 20
+#define SCL_PIN 21
 
-// Debounce Settings
-const unsigned long debounceDelay = 25;  // The debounce time in ms to consider a press stable
+const unsigned long debounceDelay = 25;  // ms a button must stay steady to count
 
 
-// Arrays to track last state and debounce timing for each button (initially, all buttons are LOW state and 0 debounce time)
-int lastButtonState[8] = { LOW, LOW, LOW, LOW, LOW, LOW, LOW, LOW };                 // Stores last state (HIGH or LOW) for each button
-unsigned long lastDebounceTime[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };                      // Stores last time the output pin was toggled (change was detected)
-bool buttonPressed[8] = { false, false, false, false, false, false, false, false };  // if a button is pressed (active = true)
+// Debounce state for buttons 1-8
+int lastButtonState[8] = { LOW, LOW, LOW, LOW, LOW, LOW, LOW, LOW };                 // Last raw reading
+unsigned long lastDebounceTime[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };                      // When the reading last changed
+bool buttonPressed[8] = { false, false, false, false, false, false, false, false };  // Debounced state, LOW = pressed
 
-// Track if emergency button is pressed (active = true)
-bool emergencyButtonState = false;
-bool setTens = false;
-bool setDist = false;
+bool emergencyButtonState = false;  // In emergency stop
+bool setTens = false;               // Set Load screen open
+bool setDist = false;               // Set Range screen open
 // Joysticks Settings
 int leftJoystickxVal;
 int leftJoystickyVal;
 int rightJoystickxVal;
 int rightJoystickyVal;
-int deadzone = 160;
-int joystickDeadzone = 25;
+int deadzone = 160;         // Counts from center before a stick does anything
+int joystickDeadzone = 25;  // Smallest speed sent, anything lower is sent as 0
+// Each stick's resting position, measured at power-up
 int centerLeftX = 512;
 int centerLeftY = 512;
 int centerRightX = 512;
 int centerRightY = 512;
 
-// Potentiometer Settings
-uint8_t mapPotVal = 0;  // Pot reading in the units of the open setpoint screen
+uint8_t mapPotVal = 0;  // Knob value on the open setpoint screen, lbs or cm
 
-// LCD Screen Settings
-LiquidCrystal_I2C lcd(0x27, 16, 2);  // Set the LCD address to 0x27 for 16 chars and 2 line display
-uint16_t potCTR = 0;
+LiquidCrystal_I2C lcd(0x27, 16, 2);  // I2C address 0x27, 16x2
+uint16_t potCTR = 0;                 // Unused
 
-// NRF24 Settings *** NOTE *** : NRF24L01+PA+LNA USES 3.3V ON THE ARDUINO NOT 5V. CONNECTING IT TO 5V WILL FRY IT
+// The NRF24L01+PA+LNA runs on 3.3 V. Connecting it to 5 V will destroy it.
 RF24 radio(CE_PIN, CSN_PIN);
-const byte address[5] = { 'T', 'E', 'S', 'T', '1' };  // Unique address for communication (must match on both ends)
-const char message[] = "Transmission Testing. . . ";
-char receivedData[32];
+const byte address[5] = { 'T', 'E', 'S', 'T', '1' };  // Must match the machine
+const char message[] = "Transmission Testing. . . ";  // Unused
+char receivedData[32];                                 // Unused
 
-// Structure to send controller data
+// Must match the struct in the master control file exactly
 struct ControllerPacket {
-  char buttonID;  // '#' to '#', 'E' for emergency button, '0' for nothing
+  char buttonID;  // '1'-'8' on a button press, '0' otherwise
   bool b_EMERGENCY;
-  uint8_t winch_spd;  // Left joystick horizontal direction data
+  uint8_t winch_spd;  // From A1
   bool winch_dir;
-  uint8_t traction_spd;  // Left joystick vertical direction data
+  uint8_t traction_spd;  // From A0
   bool traction_dir;
-  uint8_t circum_spd;  // Right joystick horizontal direction data
+  uint8_t circum_spd;  // From A9
   bool circum_dir;
-  uint8_t radial_spd;  // Right joystick vertical direction data
+  uint8_t radial_spd;  // From A8
   bool radial_dir;
-  uint8_t tensionSet;
+  uint8_t tensionSet;  // Tension setpoint in lbs, 0 = none yet
   uint8_t rangeSet;  // Range hold setpoint in cm, 0 = hold off
 };
 
-ControllerPacket packet = { '9', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };  // tensionSet/rangeSet 0 = no setpoint yet
+ControllerPacket packet = { '9', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 // Must match the master's RANGE_SET_MIN_CM / RANGE_SET_MAX_CM
 const uint8_t RANGE_SET_MIN_CM = 5;
 const uint8_t RANGE_SET_MAX_CM = 99;
 
-// Initliaze and decalre receiving variables
+// Reply from the machine
 uint8_t ackArr[3] = { 0, 255, 0 };  // Load lbs, range cm (255 = no reading), status bits
 #define ACK_RANGE_HOLD 0x01
 #define ACK_RANGE_FAULT 0x02
@@ -113,10 +109,9 @@ void ZeroMotionCommands() {
 }
 
 void setup() {
-  Serial.begin(115200);  // Start Serial Monitor
+  Serial.begin(115200);
 
-  // Set Pin Modes
-  // Note: All buttons are connected with internal pull-up resistors (reads LOW when not pressed)
+  // Buttons use the internal pull-ups, so they read LOW when pressed
   pinMode(Tension_On_Button, INPUT_PULLUP);                   // Button 1
   pinMode(Tension_Off_Button, INPUT_PULLUP);                  // Button 2
   pinMode(Tension_Set_Point_Button, INPUT_PULLUP);            // Button 3
@@ -132,13 +127,13 @@ void setup() {
   pinMode(Right_Joystick_Up_Down_Y, INPUT);                   // Right Joystick Vertical (Y) Direction
   pinMode(Potentiometer, INPUT);                              // LCD Screen Joystick
 
-  // Sticks must be released here. A center more than 150 counts from mid-scale is rejected.
+  // Don't touch the sticks during power-up. A stick more than 150 counts off center is ignored and 512 used.
   centerLeftX = CalibrateAxis(Left_Joystick_Left_Right_X);
   centerLeftY = CalibrateAxis(Left_Joystick_Up_Down_Y);
   centerRightX = CalibrateAxis(Right_Joystick_Left_Right_X);
   centerRightY = CalibrateAxis(Right_Joystick_Up_Down_Y);
 
-  // Radio Setup Settings
+  // Radio, settings must match the machine
   radio.begin();
   radio.setDataRate(RF24_250KBPS);
   radio.setPALevel(RF24_PA_LOW);
@@ -146,38 +141,35 @@ void setup() {
   radio.enableAckPayload();
   radio.setAutoAck(true);
   radio.setChannel(76);
-  radio.openWritingPipe(address);  // Where we send data
+  radio.openWritingPipe(address);
   printf_begin();
   radio.printPrettyDetails();
 
-  // LCD Screen Setup Settings
-  lcd.init();       // Initialize the LCD
-  lcd.backlight();  // Turn on the backlight and print a message
+  lcd.init();
+  lcd.backlight();
   LCDScreen();
 }
 
-// Function to check for button debounce and prints the name of the button if it is pressed
+// Debounces button i (0-7). On a new press it handles the setpoint screens and
+// sends a packet with that button's ID.
 void CheckButtonDebouncePressed(int pin, int i, const char* buttonName) {
   int reading = digitalRead(pin);
 
-  // If the reading is different from the last time, reset the debounce timer
-  if (reading != lastButtonState[i]) {
-    lastDebounceTime[i] = millis();  // Save debounce time
+  if (reading != lastButtonState[i]) {  // Still bouncing, restart the timer
+    lastDebounceTime[i] = millis();
   }
 
-  // Update the >> specific << button (at index i) state if it has stayed the same for debounceDelay time
-  if ((millis() - lastDebounceTime[i]) > debounceDelay) {
-    // If the button state has changed (stable reading)
+  if ((millis() - lastDebounceTime[i]) > debounceDelay) {  // Steady long enough
     if (reading != buttonPressed[i]) {
-      buttonPressed[i] = reading;  // Save the new button pressed state
+      buttonPressed[i] = reading;
 
-      if (buttonPressed[i] == LOW) {  // Only do action on LOW (pressed)
+      if (buttonPressed[i] == LOW) {  // Pressed
         Serial.print("Button ");
         Serial.print(i + 1);
         Serial.print(" Pressed: ");
         Serial.println(buttonName);
 
-        // Only one setpoint screen is open at a time. Its confirm button sends the value and closes it.
+        // Only one setpoint screen can be open. Its confirm button sends the value and closes it.
         if (i == 2) {
           setTens = !setTens;
           setDist = false;
@@ -201,64 +193,60 @@ void CheckButtonDebouncePressed(int pin, int i, const char* buttonName) {
     }
   }
 
-  // Update last known state button
   lastButtonState[i] = reading;
 }
 
+// Emergency button enters the emergency stop. Emergency + Button 8 together leave it.
 void CheckEmergencyButton() {
   int emergencyReading = digitalRead(Emergency_Button);
-  int button8Reading = digitalRead(Chainsaw_Distance_Indicated_Button);  // Button 8
+  int button8Reading = digitalRead(Chainsaw_Distance_Indicated_Button);
 
   if (!emergencyButtonState) {
-    // NORMAL operation: Detect if Emergency Button is pressed to enter EMERGENCY
     if (emergencyReading == LOW) {
-      emergencyButtonState = true;  // Enter emergency mode
+      emergencyButtonState = true;
       Serial.println("EMERGENCY BUTTON PRESSED - SYSTEM SHUTDOWN!");
 
       ZeroMotionCommands();
       packet.rangeSet = 0;  // The range hold needs a new confirm after recovery
-      setTens = false;      // Button 8 is held during recovery, it must not confirm a setpoint
+      setTens = false;      // Close the screens so Button 8 in the recovery can't confirm a range
       setDist = false;
       packet.b_EMERGENCY = 1;
       packet.buttonID = '0';
       SendPacket();
 
-      // LCD Print Warning
       lcd.clear();
       lcd.setCursor(0, 0);
       lcd.print("EMERGENCY!");
       lcd.setCursor(0, 1);
       lcd.print("SYSTEM SHUTDOWN");
 
-      // Flash LCD
+      // Flash the backlight, resending the stop in case a packet was lost
       for (int i = 0; i < 5; i++) {
         lcd.noBacklight();
         delay(200);
-        SendPacket();  // Retry the emergency state while the display is blocking
+        SendPacket();
         lcd.backlight();
         delay(200);
         SendPacket();
       }
     }
   } else {
-    // EMERGENCY MODE: Detect if Emergency Button + Button 8 are pressed together to recover
     if (emergencyReading == LOW && button8Reading == LOW) {
-      emergencyButtonState = false;  // Exit emergency mode
+      emergencyButtonState = false;
       Serial.println("EMERGENCY RECOVERED - SYSTEM CONTINUING OPERATION");
 
       ZeroMotionCommands();
-      packet.b_EMERGENCY = 0;  // Notify system recovery
+      packet.b_EMERGENCY = 0;  // Releases the machine
       packet.buttonID = '8';
       SendPacket();
 
-      // LCD Recovery Message
       lcd.clear();
       lcd.setCursor(0, 0);
       lcd.print("SYSTEM RECOVERED");
       lcd.setCursor(0, 1);
       lcd.print("RESUMING...");
 
-      delay(2000);  // Small recovery delay to avoid re-triggering immediately
+      delay(2000);  // Time to let go of the buttons
     }
   }
 }
@@ -282,8 +270,8 @@ void ReadJoystick() {
   // Serial.print(rightJoystickxVal);
   // Serial.print(" | Right Joystick Y: ");
   // Serial.println(rightJoystickyVal);
-  
 
+  // Only used by the debug printout below. Its labels are wrong, see the pin definitions.
   bool leftJoystickxValCentered = abs(leftJoystickxVal - 512) < deadzone;
   bool leftJoystickyValCentered = abs(leftJoystickyVal - 512) < deadzone;
   bool rightJoystickxValCentered = abs(rightJoystickxVal - 512) < deadzone;
@@ -320,7 +308,7 @@ void ReadJoystick() {
   */
 }
 
-int CalibrateAxis(int pin) {
+int CalibrateAxis(int pin) {  // Average resting reading of one stick axis
   long sum = 0;
   const int samples = 16;
   for (int i = 0; i < samples; i++) {
@@ -328,11 +316,11 @@ int CalibrateAxis(int pin) {
     delay(2);
   }
   int center = (int)(sum / samples);
-  if (abs(center - 512) > 150) return 512;  // Held or failed axis; fall back to mid-scale
+  if (abs(center - 512) > 150) return 512;  // Stick held or faulty, use mid-scale
   return center;
 }
 
-int AxisSpeed(int value, int center) {
+int AxisSpeed(int value, int center) {  // 0-193 by how far the stick is past the deadzone
   int distance = abs(value - center);
   if (distance <= deadzone) return 0;
   int output = map(distance - deadzone, 0, 512 - deadzone, 0, 193);
@@ -341,8 +329,8 @@ int AxisSpeed(int value, int center) {
   return output;
 }
 
-// Speed stays 0 until the stick is far enough from center to choose a direction.
-// Otherwise a small deflection reused the previous direction.
+// Sets one motor's speed and direction from a stick axis. Direction and speed
+// both change only outside the deadzone, so a motor never starts in a stale direction.
 void ApplyAxis(int value, int center, uint8_t& speed, bool& dir) {
   if (value < center - deadzone) {
     dir = true;
@@ -356,13 +344,13 @@ void ApplyAxis(int value, int center, uint8_t& speed, bool& dir) {
 }
 
 void JoystickLeftPWM(int joystickxVal, int joystickyVal) {
-  // Caller passes physical Y first (winch) and physical X second (traction).
+  // First argument is A1 (winch), second is A0 (traction)
   ApplyAxis(joystickxVal, centerLeftY, packet.winch_spd, packet.winch_dir);
   ApplyAxis(joystickyVal, centerLeftX, packet.traction_spd, packet.traction_dir);
 }
 
 void JoystickRightPWM(int joystickxVal, int joystickyVal) {
-  // Caller passes physical Y first (circumferential) and physical X second (radial).
+  // First argument is A9 (circumferential), second is A8 (radial)
   ApplyAxis(joystickxVal, centerRightY, packet.circum_spd, packet.circum_dir);
   ApplyAxis(joystickyVal, centerRightX, packet.radial_spd, packet.radial_dir);
 }
@@ -388,8 +376,7 @@ void SendPacket() {
     Serial.print(" Right Joystick Y: ");
     Serial.println(packet.radial_spd);
 */
-    if (radio.isAckPayloadAvailable()) {
-      // Read back exactly sizeof(ackArr) bytes
+    if (radio.isAckPayloadAvailable()) {  // The machine's reply: load, range, status
       radio.read(ackArr, sizeof(ackArr));
       //Serial.print("Received ACK array: ");
       //Serial.print(ackArr[0]);
@@ -401,45 +388,6 @@ void SendPacket() {
   }
 }
 
-// void LCDScreen() {
-//   //lcd.clear();
-
-//   //lcd.print("Load: ");
-//   //lcd.print(mapPotVal);
-
-//   lcd.setCursor(0, 0);  // Start of first line (first row, first column)
-
-//   if (setTens) {
-//     lcd.print("Set Load: ");
-//     lcd.print(mapPotVal);
-//     setDist = 0;
-//     packet.tensionSet = mapPotVal;
-//   } else if (setDist) {
-//     lcd.print("Set Range: ");
-//     lcd.print(mapPotVal);
-//     setTens = 0;
-//   } else {
-//     lcd.print("Load: ");
-//     if (ackArr[0] == 255) {
-//       lcd.print("255+");
-//       lcd.print(" lbs");
-//     } else {
-//       lcd.print(ackArr[0]);
-//       lcd.print(" lbs");
-//     }
-
-//     lcd.setCursor(0, 1);  // Start of second line (second row, first column)
-//     lcd.print("Range: ");
-//     if (ackArr[1] > 200) {
-//       lcd.print("200+");
-//       lcd.print(" cm");
-//     } else {
-//       lcd.print(ackArr[1]);
-//       lcd.print(" cm");
-//     }
-//   }
-// }
-
 uint8_t PotToTension() {
   return map(analogRead(Potentiometer), 0, 1023, 10, 175);
 }
@@ -448,20 +396,20 @@ uint8_t PotToRange() {
   return map(analogRead(Potentiometer), 0, 1023, RANGE_SET_MIN_CM, RANGE_SET_MAX_CM);
 }
 
-void ShowConfirm(uint8_t value, const char* unit) {
+void ShowConfirm(uint8_t value, const char* unit) {  // "Confirmed N" for 1.5 s
   confirmValue = value;
   confirmUnit = unit;
   confirmUntil = millis() + 1500;
 }
 
-void LCDLine(uint8_t row, const char* text) {  // Pads to 16 chars so old text never lingers
+void LCDLine(uint8_t row, const char* text) {  // Pads to 16 chars to overwrite old text
   char buf[17];
   snprintf(buf, sizeof(buf), "%-16s", text);
   lcd.setCursor(0, row);
   lcd.print(buf);
 }
 
-void LCDScreen() {
+void LCDScreen() {  // Setpoint screen if one is open, otherwise load and range
   char line[17];
 
   if (setTens) {
@@ -490,7 +438,7 @@ void LCDScreen() {
 
   char range[5];
   if (ackArr[1] == 255) {
-    snprintf(range, sizeof(range), "--");  // No echo, the master is not holding on this
+    snprintf(range, sizeof(range), "--");  // No echo
   } else if (ackArr[1] > 200) {
     snprintf(range, sizeof(range), "200+");
   } else {
@@ -508,24 +456,20 @@ void LCDScreen() {
 }
 
 void loop() {
-  // Always check emergency button first
   CheckEmergencyButton();
   if (emergencyButtonState) {
     ZeroMotionCommands();
     packet.b_EMERGENCY = 1;
     packet.buttonID = '0';
-    SendPacket();  // Keep asserting the stop until the recovery packet is sent
+    SendPacket();  // Keep sending the stop until recovery
     return;
   }
 
-  // Read Joystick Movements
+  // Joystick packet every loop, plus one extra packet per button press
   ReadJoystick();
-
-  // If not button pressed, send only current joysticks data
   packet.buttonID = '0';
   SendPacket();
 
-  // Check each button debounce/pressed
   CheckButtonDebouncePressed(Tension_On_Button, 0, "Tension On Button");
   CheckButtonDebouncePressed(Tension_Off_Button, 1, "Tension Off Button");
   CheckButtonDebouncePressed(Tension_Set_Point_Button, 2, "Tension Set Point Button");
@@ -535,10 +479,5 @@ void loop() {
   CheckButtonDebouncePressed(Chainsaw_Distance_Set_Point_Button, 6, "Chainsaw Distance Set Point Button");
   CheckButtonDebouncePressed(Chainsaw_Distance_Indicated_Button, 7, "Chainsaw Distance Indicated Button");
 
-  // Display Values on LCD Screen
-
   LCDScreen();
-
-
-  //delay(500);  // Slight pause to reduce Serial spam & avoid false readings
 }

@@ -813,11 +813,11 @@ So the remote sends a steady stream of joystick packets (buttonID '0') plus extr
 
 These are factual observations from reading the code — **not** changes. Flagged so you fully understand the code's real behavior.
 
-1. **Swapped comment labels (master, pin defs).** The block commented "Circumferential Motor Pins" defines the **Winch** pins; the block commented "Winch Motor Pins" defines the **Circumferential** pins. The `#define` *names* are correct and used correctly everywhere; only the comments are swapped.
+1. **Comments were corrected to match the code.** The winch/circumferential pin block labels, the timer prescaler comments (Timers 3 and 4 use **1024**, Timer 5 uses **64**), the HX711 pin comments, and the ISR labels all now describe what the code does. The code itself is unchanged.
 
-2. **Timer prescaler comments are wrong (master, `PWMTimerInit`).** Comments say 64 for Timers 3/4 but the bits select **1024**; the comment says 1024 for Timer 5 but the bits select **64**. The hardware follows the bits. This affects each motor's PWM frequency. (Documented in [section 6](#6-the-timer--pwm-subsystem).)
+2. **Different PWM frequencies per motor.** Because of those prescalers, the winch PWM (Timer 5) runs 16 times faster than the traction and circumferential PWM. See [section 6](#6-the-timer--pwm-subsystem).
 
-3. **Stale pin comments (master).** `DT_PIN`/`SCK_PIN` comments say "D2/D3" but the values are 17/18. Several ISR comments say "Winch" where the pin is actually circumferential.
+3. **Remote joystick pin names don't match the stick directions.** For example, `Left_Joystick_Up_Down_Y` (A1) is the left stick's left/right motion. The pin comments now say what each pin drives; the names were left alone. See Issue #9.
 
 4. **Ultrasonic electrical and trigger timing are explicit.** `Ultrasonic_ECHO` is configured `INPUT`, avoiding output-driver contention with the sensor. `ultraSonic()` generates the sensor's required 2 µs LOW / 10 µs HIGH trigger sequence before reading the echo. A missed echo is reported as "no reading" (`255`, shown as "--"), not as 0 cm.
 
