@@ -67,6 +67,12 @@ The MD25HV control bank is `GND / 5Vo / PWM / DIR` (per the supplied wiring diag
 > polarity or firmware direction mapping consistently before operation. Manual
 > mode also uses HIGH when `winch_dir == true` and permits duty up to 150,
 > compared with the automatic PID limit of 30.
+>
+> **Verified on the machine:** in manual mode, moving the left joystick right
+> tightens and left loosens. That does not yet fix the pin level, because the
+> stick's ADC direction is unknown. Hold the stick right (tightening) and measure
+> D29: ~0 V (LOW) confirms the PID convention; ~5 V (HIGH) means the PID's
+> `Winch_DIR` levels and `winchRelieve()` must be swapped.
 
 ---
 

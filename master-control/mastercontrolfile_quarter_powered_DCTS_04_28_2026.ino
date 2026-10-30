@@ -55,9 +55,21 @@ const unsigned long connectionTimeout = 200;  // ms
 
 uint8_t Target_Weight = 30;  // Adjustable Target Weight global var
 
-// Ultrasonic sensor duration var
-unsigned long ultra_dur;
-unsigned long ultra_dis;
+// Ultrasonic sensor
+const unsigned long ULTRA_PERIOD_MS = 60;      // HC-SR04 needs ~60 ms between pings for old echoes to die out
+const unsigned long ULTRA_TIMEOUT_US = 15000;  // ~257 cm, also caps how long pulseIn can block the loop
+const uint8_t ULTRA_MIN_CM = 2;                // Below the HC-SR04's working range
+const uint8_t ULTRA_MAX_MISSES = 3;            // Consecutive missed echoes before the range is invalid
+unsigned long ultra_dur;                       // Echo pulse width, us
+unsigned long lastPingTime = 0;
+unsigned long lastRangeTime = 0;  // millis() of the last valid range
+uint16_t rangeHistory[3];         // Last valid readings, for the median filter
+uint8_t rangeCount = 0;
+uint8_t rangeIdx = 0;
+uint8_t rangeMisses = 0;
+uint16_t rangeCm = 0;         // Filtered distance to the trunk
+bool rangeValid = false;      // False until a reading arrives, and after ULTRA_MAX_MISSES misses
+bool rangeNewSample = false;  // Set on each valid reading, consumed by rangeHold()
 
 // HX711 & load cell variables
 HX711 scale;               // ADC Init
@@ -99,6 +111,7 @@ struct ControllerPacket {
   uint8_t radial_spd;
   bool radial_dir;
   uint8_t tensionSet;
+  uint8_t rangeSet;  // Range hold setpoint in cm, 0 = hold off
 };
 
 bool isValid(const ControllerPacket& p) {  // Verifies packet sends valid struct
@@ -113,7 +126,10 @@ ControllerPacket rxPkt;
 ControllerPacket tempPkt;
 bool radioSent = 0;
 
-uint8_t ackArr[2];  // Send back tension and distance values
+// Send back tension (lbs), distance (cm, 255 = no reading), and status bits
+uint8_t ackArr[3] = { 0, 255, 0 };
+#define ACK_RANGE_HOLD 0x01   // Range hold is running
+#define ACK_RANGE_FAULT 0x02  // Range hold stopped itself, see rangeHoldFault()
 
 // Dir Speed Dampening
 bool currDIR = 0;
@@ -190,7 +206,7 @@ void emergency() {  // Turn off all motors when emergency button is pressed and 
   manualCircumControl(0, 0);
   manualTractControl(0, 0);
   manualTensionControl(0, 0);
-  manualRadialControl(0, 0);
+  rangeHoldOff();
   digitalWrite(Chainsaw_EN, LOW);
   while (rxPkt.b_EMERGENCY) {  // Stay locked until the controller explicitly clears its emergency state
     radioRX();
@@ -246,14 +262,14 @@ void PWMTimerInit() {  // initializes the PWM for motor speed
   TCCR1A = 0;
   TCCR1B = 0;
 
-  // --- Set to CTC Mode ---
-  // WGM62:0 = 0b010 → CTC mode for Timer6 (8-bit timer on Mega)
-  TCCR1B |= (1 << WGM12);  // On Mega, Timer6 WGM bits are slightly different
+  // --- Set to CTC Mode (WGM12), Timer1 is the 16-bit stepper timer ---
+  TCCR1B |= (1 << WGM12);
 
   // --- Set Prescaler ---
   // Prescaler = 1024
   TCCR1B |= (1 << CS12) | (1 << CS10);
 
+  // 16 MHz / 1024 / 201 = ~77.7 toggles/s, so ~39 steps/s. Lower is faster.
   OCR1A = 200;
 
   // --- Enable Timer Compare Interrupt ---
@@ -552,6 +568,134 @@ void manualRadialControl(bool on, bool dir) {
   }
 }
 
+//////////////////
+// Radial Range Hold
+// Holds the stepper at rangeSet cm from the trunk using the ultrasonic reading.
+// The stepper only has one speed, so this is on/off with a deadband: start moving
+// once the error passes RANGE_DEADBAND_CM, stop once the error reaches zero.
+// There are no limit switches, so a move that stops closing the error faults out.
+
+const uint8_t RANGE_SET_MIN_CM = 5;      // Must match the remote's Set Range pot mapping
+const uint8_t RANGE_SET_MAX_CM = 99;
+const uint8_t RANGE_DEADBAND_CM = 2;     // Error allowed before the stage moves
+const unsigned long RANGE_STALE_MS = 300;  // No valid reading for this long stops the hold
+
+// manualRadialControl() dir value that moves the stage toward the trunk. VERIFY on the
+// rig with the joystick. If it is wrong the hold moves away and faults on RANGE_WRONG_WAY_CM.
+const bool RADIAL_DIR_TOWARD_TREE = true;
+
+// A move must close the error by RANGE_PROGRESS_CM every RANGE_PROGRESS_MS, otherwise the
+// stage is stalled or at the end of its travel. PLACEHOLDER: depends on the stage's mm/step.
+const unsigned long RANGE_PROGRESS_MS = 5000;
+const uint8_t RANGE_PROGRESS_CM = 1;
+const uint8_t RANGE_WRONG_WAY_CM = 3;  // Error growth during a move that means the wrong direction
+
+uint8_t Target_Range = 0;       // Active setpoint, cm
+bool rangeHoldActive = false;
+bool rangeFault = false;        // Latched until the remote sends a new rangeSet
+bool rangeSetPrimed = false;    // First packet after boot only records rangeSet
+uint8_t lastRangeSet = 0;       // Last rangeSet received, holds engage on a change
+int8_t radialMotion = 0;        // 1 toward the trunk, -1 away, 0 stopped
+uint16_t moveStartAbsErr = 0;   // |error| when the current move began
+uint16_t bestAbsErr = 0;        // Smallest |error| seen during the current move
+unsigned long lastProgressTime = 0;
+
+void radialStop() {
+  radialMotion = 0;
+  manualRadialControl(0, 0);
+}
+
+void rangeHoldOff() {  // Stop the stage and drop the hold, the remote must send a new setpoint
+  rangeHoldActive = false;
+  radialStop();
+}
+
+void rangeHoldFault() {
+  rangeFault = true;
+  rangeHoldOff();
+}
+
+void radialMove(int8_t motion, uint16_t absErr) {
+  radialMotion = motion;
+  moveStartAbsErr = absErr;
+  bestAbsErr = absErr;
+  lastProgressTime = millis();
+  manualRadialControl(1, (motion > 0) ? RADIAL_DIR_TOWARD_TREE : !RADIAL_DIR_TOWARD_TREE);
+}
+
+void rangeHold() {
+  unsigned long now = millis();
+  if (!rangeValid || now - lastRangeTime > RANGE_STALE_MS) {  // Never move blind
+    rangeHoldFault();
+    return;
+  }
+  if (!rangeNewSample) {
+    return;
+  }
+  rangeNewSample = false;
+
+  int error = (int)rangeCm - (int)Target_Range;  // Positive means too far from the trunk
+  uint16_t absErr = abs(error);
+
+  if (radialMotion != 0) {
+    bool reached = (radialMotion > 0) ? (error <= 0) : (error >= 0);
+    if (reached) {  // Stop, a reversal waits for the next sample
+      radialStop();
+      return;
+    }
+    if (absErr >= moveStartAbsErr + RANGE_WRONG_WAY_CM) {
+      rangeHoldFault();
+      return;
+    }
+    if (absErr + RANGE_PROGRESS_CM <= bestAbsErr) {
+      bestAbsErr = absErr;
+      lastProgressTime = now;
+    } else if (now - lastProgressTime > RANGE_PROGRESS_MS) {
+      rangeHoldFault();
+    }
+    return;
+  }
+
+  if (error > RANGE_DEADBAND_CM) {
+    radialMove(1, absErr);
+  } else if (error < -RANGE_DEADBAND_CM) {
+    radialMove(-1, absErr);
+  }
+}
+
+void rangeSetUpdate() {  // Engage, retarget, or cancel the hold when the remote's rangeSet changes
+  if (!rangeSetPrimed) {  // A master reboot must not start the stage on a stale remote setpoint
+    rangeSetPrimed = true;
+    lastRangeSet = rxPkt.rangeSet;
+    return;
+  }
+  if (rxPkt.rangeSet == lastRangeSet) {
+    return;
+  }
+  lastRangeSet = rxPkt.rangeSet;
+  rangeFault = false;
+  radialStop();
+  if (rxPkt.rangeSet >= RANGE_SET_MIN_CM && rxPkt.rangeSet <= RANGE_SET_MAX_CM) {
+    Target_Range = rxPkt.rangeSet;
+    rangeHoldActive = true;
+    rangeNewSample = false;  // Act on a reading taken after the setpoint arrived
+  } else {
+    rangeHoldActive = false;  // 0 or out of range cancels
+  }
+}
+
+void radialControl() {
+  if (rxPkt.radial_spd > 20) {  // The joystick always wins and drops the hold
+    rangeHoldActive = false;
+    radialMotion = 0;
+    manualRadialControl(1, rxPkt.radial_dir);
+  } else if (rangeHoldActive) {
+    rangeHold();
+  } else {
+    radialStop();
+  }
+}
+
 void manualController() {
   switch (testchar) {
     case 'E':  // Emergency
@@ -784,16 +928,44 @@ void printControllerDebug() {  // Prints every joystick value
   // Serial.println();  // Blank line for readability
 }
 
-void ultraSonic() {
+uint16_t median3(uint16_t a, uint16_t b, uint16_t c) {
+  if (a > b) {
+    uint16_t t = a;
+    a = b;
+    b = t;
+  }
+  if (b > c) b = c;
+  return (a > b) ? a : b;
+}
+
+void ultraSonic() {  // One ping, filtered into rangeCm / rangeValid
   digitalWrite(Ultrasonic_TRIG, LOW);
   delayMicroseconds(2);
   digitalWrite(Ultrasonic_TRIG, HIGH);
   delayMicroseconds(10);
   digitalWrite(Ultrasonic_TRIG, LOW);
-  ultra_dur = pulseIn(Ultrasonic_ECHO, HIGH, 30000);
-  ultra_dis = ultra_dur * 0.0343 / 2;
+  ultra_dur = pulseIn(Ultrasonic_ECHO, HIGH, ULTRA_TIMEOUT_US);
+  uint16_t cm = (uint16_t)(ultra_dur * 0.0343f / 2.0f);
   // Serial.println(ultra_dur);
-  // Serial.println(ultra_dis);
+  // Serial.println(cm);
+
+  if (ultra_dur == 0 || cm < ULTRA_MIN_CM) {  // A timeout returns 0, which is not "touching the trunk"
+    if (rangeMisses < 255) rangeMisses++;
+    if (rangeMisses >= ULTRA_MAX_MISSES) {
+      rangeValid = false;
+      rangeCount = 0;  // Don't let old readings vote once the echo comes back
+    }
+    return;
+  }
+  rangeMisses = 0;
+
+  rangeHistory[rangeIdx] = cm;
+  rangeIdx = (rangeIdx + 1) % 3;
+  if (rangeCount < 3) rangeCount++;
+  rangeCm = (rangeCount < 3) ? cm : median3(rangeHistory[0], rangeHistory[1], rangeHistory[2]);
+  rangeValid = true;
+  rangeNewSample = true;
+  lastRangeTime = millis();
 }
 
 void setup() {  // Runs all initializing functions
@@ -827,9 +999,14 @@ void mainControl() {  // Manages all movement and calls radio RX function
       newSample = true;
     }
     ackArr[0] = reading / 10430.0;
-    ultraSonic();
-    ackArr[1] = ultra_dis;
     //// Serial.println(ackArr[0]);
+  }
+
+  // Pinged on its own clock so pulseIn doesn't delay the tension PID's samples
+  if (millis() - lastPingTime >= ULTRA_PERIOD_MS) {
+    lastPingTime = millis();
+    ultraSonic();
+    ackArr[1] = rangeValid ? (uint8_t)min(rangeCm, (uint16_t)254) : 255;
   }
   // Get reading
   //// Serial.println(radioSent);
@@ -859,7 +1036,8 @@ void mainControl() {  // Manages all movement and calls radio RX function
     // Manual control of motors
     manualCircumControl(rxPkt.circum_spd, rxPkt.circum_dir);
     manualTractControl(rxPkt.traction_spd, rxPkt.traction_dir);
-    manualRadialControl(((rxPkt.radial_spd > 20)), rxPkt.radial_dir);
+    rangeSetUpdate();
+    radialControl();
 
     // if (rxPkt.winch_spd < rxPkt.circum_spd) {  // If DCTS isn't enabled, allow manual control
     //   manualCircumControl(rxPkt.circum_spd, rxPkt.circum_dir);
@@ -874,10 +1052,12 @@ void mainControl() {  // Manages all movement and calls radio RX function
     manualCircumControl(0, 0);
     manualTractControl(0, 0);
     manualTensionControl(0, 0);
-    manualRadialControl(0, 0);
+    rangeHoldOff();  // Not resumed by the link returning, the remote must send a new setpoint
     digitalWrite(Chainsaw_EN, LOW);
     resetPID();  // Link is down, start clean when it comes back
   }
+
+  ackArr[2] = (rangeHoldActive ? ACK_RANGE_HOLD : 0) | (rangeFault ? ACK_RANGE_FAULT : 0);
 }
 
 void loop() {

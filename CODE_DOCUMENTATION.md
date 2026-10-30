@@ -53,7 +53,7 @@ Two sensors feed the machine:
 | Sensor | Measures | Read by |
 |--------|----------|---------|
 | **HX711 + S-type load cell** | Cable tension (as a tare-corrected ADC count called "quanta") | `scale.get_value(1)` |
-| **HC-SR04-style ultrasonic** | Radial distance to the trunk (cm) | `ultraSonic()` via `pulseIn` |
+| **HC-SR04-style ultrasonic** | Radial distance to the trunk (cm), feedback for the range hold | `ultraSonic()` via `pulseIn`, every 60 ms |
 
 The **tension system** is the only closed-loop behavior in the current code. It is named **DCTS** (Dynamic Cable Tension System) and lives in the `DCTS()` function. In the current working tree that function is a **real PID loop** — proportional, integral, and derivative terms running once per fresh load-cell sample with real `millis()` timing — replacing the v1.1 bang-bang algorithm (see [section 5](#5-the-dynamic-cable-tension-system-dcts)). Everything else is open-loop manual control driven directly by the operator's joysticks.
 
@@ -75,7 +75,7 @@ Both boards use the **nRF24L01** radio (the `RF24` library) configured identical
 
 The master calls `openReadingPipe(1, address)` and `startListening()` (it receives). The remote calls `openWritingPipe(address)` (it transmits). Both use **CE pin 49** and **CSN pin 53**.
 
-**The acknowledgement (ack) payload** is the clever part of the link: when the remote sends a packet, the master's radio hardware automatically replies with a 2-byte array (`ackArr`). The master loads that array with `ackArr[0] = load (lbs)` and `ackArr[1] = range (cm)`. The remote reads it back inside `SendPacket()` and displays it on the LCD. This gives two-way data over a one-way `write()` call.
+**The acknowledgement (ack) payload** is the clever part of the link: when the remote sends a packet, the master's radio hardware automatically replies with a 3-byte array (`ackArr`). The master loads that array with `ackArr[0] = load (lbs)`, `ackArr[1] = range (cm, capped at 254; 255 = no valid reading)`, and `ackArr[2] = status bits` (`0x01` range hold running, `0x02` range hold faulted). The remote reads it back inside `SendPacket()` and displays it on the LCD. This gives two-way data over a one-way `write()` call.
 
 > ⚠️ **3.3 V warning** (remote L68): the nRF24L01+PA+LNA module runs on **3.3 V**, not 5 V. Connecting it to 5 V destroys it.
 
@@ -98,20 +98,24 @@ struct ControllerPacket {
   uint8_t radial_spd;    // radial/stepper speed  (from RIGHT joystick Y)
   bool    radial_dir;    // radial direction
   uint8_t tensionSet;    // operator's desired tension setpoint (lbs), chosen via potentiometer
+  uint8_t rangeSet;      // radial range hold setpoint (cm), 0 = hold off
 };
 ```
 
 **Critical mapping to understand:** the field names do *not* always match the physical control that feeds them. The remote's `#define` comments claim one mapping (X=tension, Y=elevator), but the **actual call arguments are swapped** (see [section 7.5](#75-function-by-function) and [Issue #9](#10-known-issues-quirks-and-things-to-verify)). The mapping below reflects what the code *actually does* given the swapped argument order in `ReadJoystick()`:
 
-- `winch_spd` / `winch_dir` ← **Left joystick Y (vertical)** → controls cable tension (the winch). In the master, this is the *manual* tension command. *(The `#define` comment says X drives this, but the code passes Y.)*
+- `winch_spd` / `winch_dir` ← the left joystick axis on **A1** → controls cable tension (the winch). In the master, this is the *manual* tension command. **Verified on the machine:** this is the stick's *horizontal* motion (right tightens, left loosens), so A1's name `Left_Joystick_Up_Down_Y` is the mislabel, not the code.
 - `traction_spd` / `traction_dir` ← **Left joystick X (horizontal)** → controls the traction (climbing) wheels.
 - `circum_spd` / `circum_dir` ← **Right joystick Y (vertical)** → circumferential motor.
 - `radial_spd` / `radial_dir` ← **Right joystick X (horizontal)** → radial stepper (chainsaw in/out).
 - `tensionSet` ← **potentiometer**, set via the LCD "Set Load" flow. Default value `0`, which means no setpoint has been confirmed.
+- `rangeSet` ← **potentiometer**, set via the LCD "Set Range" flow (Button 7, then Button 8 to confirm). `0` means the range hold is off. The remote sends `0` while the Set Range screen is open, when the radial stick moves, and on e-stop. See [section 4.5](#45-radial-range-hold).
 
 > ⚠️ **Verify on hardware.** Because the argument order is swapped relative to the `#define` comments, the *physical* axis that moves each motor may not be what the labels suggest. The mapping above is derived strictly from the code's argument order; confirm against the real joysticks.
 
-The remote initializes the packet as `{ '9', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }`: buttonID `'9'`, no emergency, all speeds/dirs zero, `tensionSet = 0`. A reboot therefore cannot change the machine's setpoint until the operator confirms one.
+The remote initializes the packet as `{ '9', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }`: buttonID `'9'`, no emergency, all speeds/dirs zero, `tensionSet = 0`, `rangeSet = 0`. A reboot therefore cannot change the machine's setpoint or start the range hold until the operator confirms one.
+
+> ⚠️ The packet is 12 bytes and the ack is 3 bytes. Both boards must be flashed from the same revision.
 
 ---
 
@@ -145,10 +149,10 @@ Grouped by purpose (each is fully defined in the [glossary](#8-glossary--master-
 
 - **Connection timing:** `lastReceivedTime`, `connectionTimeout = 200 ms`.
 - **Tension setpoint:** `Target_Weight = 30` (lbs, adjustable) — **now the PID setpoint directly, in lbs.** The quanta conversions `TW_Adj = Target_Weight * 10430` and `PLMI_Adj = PLMI * 10430` (L73–74) are **vestigial** after the PID migration: `TW_Adj` is still recomputed on setpoint change (L846) but no control path reads it, and `PLMI_Adj` is unused. The constant **10430 quanta ≈ 1 lb** is the load cell's calibration slope (now the named constant `QUANTA_PER_LB`, L342).
-- **Ultrasonic:** `ultra_dur` (echo pulse width, µs), `ultra_dis` (computed distance, cm).
+- **Ultrasonic:** `ultra_dur` (echo pulse width, µs), `rangeCm` (median-filtered distance, cm), `rangeValid`, `rangeNewSample`, `lastRangeTime`, plus the filter's `rangeHistory`/`rangeCount`/`rangeIdx`/`rangeMisses` and the ping clock `lastPingTime`.
 - **Load cell / DCTS state:** `scale` (HX711 object), `DCTS_EN` (auto-tension enable flag), `reading` (tare-corrected load-cell value), `counter`, `duty_percent`, and three PWM duty temporaries `temp_OCR3B/4B/5B`.
 - **PID loop state:** declared in the PID block itself (L369–378), not in this globals section — `measured_lbs` (feedback in lbs), `sensorValid` (reading validity flag), `integral`, `prevError`, `derivFiltered`, `newSample` (fresh-read latch), `lastPIDTime` (PID `dt` clock), `overTensionStart` / `overTensionLatched` (over-tension relief timer and latch). See [section 5](#5-the-dynamic-cable-tension-system-dcts) and the [glossary](#8-glossary--master-control-file).
-- **Radio:** `radio` object, `address`, `rxPkt` (the live received packet), `tempPkt` (staging packet before validation), `radioSent` (true when a packet has recently arrived), `ackArr[2]` (the 2 bytes sent back to the remote).
+- **Radio:** `radio` object, `address`, `rxPkt` (the live received packet), `tempPkt` (staging packet before validation), `radioSent` (true when a packet has recently arrived), `ackArr[3]` (the 3 bytes sent back to the remote).
 - **Direction dampening (declared but effectively unused):** `currDIR`, `dirCTR`.
 - **Debug:** `startTimer`, `testchar` (used by the serial-driven `manualController()`).
 
@@ -162,7 +166,7 @@ Grouped by purpose (each is fully defined in the [glossary](#8-glossary--master-
 
 **`radioInit()` (L174–184)** — Configures the radio for **receiving** (see [section 2](#2-how-the-two-boards-talk-the-rf-link)): begin, 250 kbps, PA low, channel 76, open reading pipe 1 on the shared address, dynamic payloads, ack payloads, auto-ack on, then `startListening()`.
 
-**`emergency()`** — Hard stop. Disables `DCTS_EN`, stops all four motion systems, and drives `Chainsaw_EN` LOW before remaining in a blocking receive loop while `rxPkt.b_EMERGENCY` is true. The controller repeatedly transmits zero-motion emergency packets, and the deliberate Emergency + Button 8 recovery gesture sends `b_EMERGENCY = 0`. The clear packet is therefore the only exit condition; stale joystick speed or button fields cannot release the lock. On the way out the master calls `resetPID()`, and automatic tension must be explicitly re-enabled by the operator.
+**`emergency()`** — Hard stop. Disables `DCTS_EN`, stops all four motion systems (the radial stepper via `rangeHoldOff()`, which also drops the range hold), and drives `Chainsaw_EN` LOW before remaining in a blocking receive loop while `rxPkt.b_EMERGENCY` is true. The controller repeatedly transmits zero-motion emergency packets, and the deliberate Emergency + Button 8 recovery gesture sends `b_EMERGENCY = 0`. The clear packet is therefore the only exit condition; stale joystick speed or button fields cannot release the lock. On the way out the master calls `resetPID()`, and automatic tension must be explicitly re-enabled by the operator.
 
 **`PWMTimerInit()` (L201–266)** — Configures the AVR hardware timers that generate motor PWM. Detailed in [section 6](#6-the-timer--pwm-subsystem). Ends with `sei()` to enable global interrupts.
 
@@ -192,7 +196,7 @@ Grouped by purpose (each is fully defined in the [glossary](#8-glossary--master-
 
 **`manualTractControl(speed, dir)` (L503–541)** — Drives all three traction wheels together. A large commented-out block at the top shows an abandoned direction-change dampening scheme (the `currDIR`/`dirCTR` idea). The **active** code: `OCR3B = constrain(speed, 0, 193)` and sets all three traction direction pins together (LOW if `dir`, HIGH otherwise).
 
-**`manualRadialControl(on, dir)` (L543–554)** — Controls the stepper. If `on`: enable the Timer 1 compare interrupt (`TIMSK1 |= (1<<OCIE1A)`) so the stepper pulses, and set `Stepper_DIR`. If `!on`: disable that interrupt (stepper stops). Note this is an on/off + direction control — the *step rate* is fixed by Timer 1's `OCR1A`, not by a speed value. **(This is the radial system you asked to leave alone.)**
+**`manualRadialControl(on, dir)` (L543–554)** — Controls the stepper. If `on`: enable the Timer 1 compare interrupt (`TIMSK1 |= (1<<OCIE1A)`) so the stepper pulses, and set `Stepper_DIR`. If `!on`: disable that interrupt (stepper stops). Note this is an on/off + direction control — the *step rate* is fixed by Timer 1's `OCR1A` at about 39 steps/s, not by a speed value. In normal operation it is called only through `radialControl()` and the range hold (see [4.5](#45-radial-range-hold)).
 
 **`manualController()` (L556–688)** — A **serial-keyboard debug controller**. A big `switch(testchar)` mapping single letters to actions (E=emergency, O/P/I=traction, F/R=tension, Q/W=radial, T/Y=circum, S=stop all, C/N=chainsaw on/off, Z/X=unused). The line that would read `testchar` from Serial is commented out, so in normal operation `testchar` never changes and this does nothing. Kept for bench testing with just the machine and a laptop.
 
@@ -207,25 +211,75 @@ Grouped by purpose (each is fully defined in the [glossary](#8-glossary--master-
 
 **`printControllerDebug()` (L763–786)** — Calls `radioRX()` then (all Serial prints commented out) would dump every joystick value. Effectively just receives a packet.
 
-**`ultraSonic()`** — Fires the ultrasonic sensor with the HC-SR04 timing sequence: hold TRIG LOW for 2 µs, HIGH for 10 µs, then LOW. `pulseIn(Ultrasonic_ECHO, HIGH, 30000)` reads the echo width into `ultra_dur` with a 30 ms timeout. Distance `ultra_dis = ultra_dur * 0.0343 / 2` (speed of sound 343 m/s → 0.0343 cm/µs, halved for round trip).
+**`ultraSonic()`** — Fires the ultrasonic sensor with the HC-SR04 timing sequence: hold TRIG LOW for 2 µs, HIGH for 10 µs, then LOW. `pulseIn(Ultrasonic_ECHO, HIGH, ULTRA_TIMEOUT_US)` reads the echo width into `ultra_dur` with a 15 ms timeout (about 257 cm), which also caps how long the call can block the loop. Distance is `ultra_dur * 0.0343 / 2` cm (speed of sound 343 m/s → 0.0343 cm/µs, halved for round trip).
+- A timeout (`ultra_dur == 0`) or a reading under 2 cm is a **miss**, not a distance. After `ULTRA_MAX_MISSES` (3) consecutive misses, `rangeValid` goes false and the filter history is cleared.
+- A good reading goes into a 3-sample history; `rangeCm` is the median once three are available, which rejects single spurious echoes. It sets `rangeValid`, `rangeNewSample`, and `lastRangeTime`.
+
+**`median3()`** — Median of three values, used by the ultrasonic filter.
 
 **`setup()` (L802–813)** — Runs once: Serial at 115200, `radioInit()`, print "Done Initializing.", `pinInit()`, `loadCellInit()`, `PWMTimerInit()`, then `resetPID()` (starts the PID's `dt` clock, L809), then `printf_begin()` and `radio.printPrettyDetails()` to dump the radio config.
 
 **`mainControl()` (L815–879)** — **The heart of the loop.** Sequence each iteration:
 1. `radioRX()` — get the latest packet.
 2. If `millis() - lastReceivedTime > connectionTimeout` (200 ms) → `radioSent = 0` (connection considered lost).
-3. If `scale.is_ready()`: read one tare-corrected sample with `scale.get_value(1)`; range-check it against `RAW_MIN_VALID`–`RAW_MAX_VALID`, setting `sensorValid` and, when valid, converting `measured_lbs = reading / QUANTA_PER_LB`; set the PID's fresh-sample latch `newSample = true`, **but only when `DCTS_EN`**, so the latch cannot go stale during manual control; then update the load and range acknowledgements. *(Both ack bytes are refreshed only when the load cell is ready.)*
+3. If `scale.is_ready()`: read one tare-corrected sample with `scale.get_value(1)`; range-check it against `RAW_MIN_VALID`–`RAW_MAX_VALID`, setting `sensorValid` and, when valid, converting `measured_lbs = reading / QUANTA_PER_LB`; set the PID's fresh-sample latch `newSample = true`, **but only when `DCTS_EN`**, so the latch cannot go stale during manual control; then update the load acknowledgement `ackArr[0]`.
+3a. Every `ULTRA_PERIOD_MS` (60 ms), independent of the load cell: `ultraSonic()`, then `ackArr[1]` = `rangeCm` capped at 254, or 255 when `rangeValid` is false. Keeping the ping off the load-cell path means its `pulseIn()` wait no longer delays the tension PID's samples.
 4. **If `radioSent` (link is alive):**
    - If `rxPkt.b_EMERGENCY` → `emergency()` (lock down until an explicit clear packet, and disable automatic tension).
    - If `tensionSet` is between 10 and 175 and differs from `Target_Weight`, adopt it as the PID setpoint in lbs, recompute vestigial `TW_Adj`, and `resetPID()`. Values outside that range, including `0` ("no setpoint"), are ignored. The comparison uses the value as sent, so a rejected reading cannot call `resetPID()` on every pass.
    - **The tension mode switch** (L851–855): if `DCTS_EN` → run `DCTS()` (the PID, auto); else → `manualTensionControl(rxPkt.winch_spd, rxPkt.winch_dir)` (manual).
    - `buttonSel()` — handle the reported button.
-   - Manual drive of the other actuators: `manualCircumControl(...)`, `manualTractControl(...)`, `manualRadialControl((rxPkt.radial_spd > 20), rxPkt.radial_dir)` (stepper turns on only past a speed threshold of 20).
-5. **Else (link lost):** clear `DCTS_EN`, zero every motion system, drive `Chainsaw_EN` LOW, and call `resetPID()`. Automatic tension does not resume when packets return; the operator must press Button 1. The last confirmed setpoint is kept. The cutting tool cannot remain latched on after RF traffic stops.
+   - Manual drive of the other actuators: `manualCircumControl(...)`, `manualTractControl(...)`.
+   - `rangeSetUpdate()` then `radialControl()` — the radial stepper, either from the joystick or the range hold ([4.5](#45-radial-range-hold)).
+5. **Else (link lost):** clear `DCTS_EN`, zero every motion system, drop the range hold with `rangeHoldOff()`, drive `Chainsaw_EN` LOW, and call `resetPID()`. Neither automatic tension nor the range hold resumes when packets return: the operator must press Button 1, and confirm a range again. The last confirmed tension setpoint is kept. The cutting tool cannot remain latched on after RF traffic stops.
+6. Write the status bits into `ackArr[2]`.
 
 **`loop()` (L881–891)** — Calls only `mainControl()`. Everything else (`manualController`, debug, standalone ultrasonic) is commented out. The comment confirms: *"This is the only function that needs to be in here."*
 
 **The ISRs (L894–929)** — Detailed in [section 6](#6-the-timer--pwm-subsystem).
+
+### 4.5 Radial range hold
+
+The range hold keeps the radial stepper (chainsaw in/out) at a set distance from the trunk, using the ultrasonic reading as feedback. It assumes the sensor moves with the stage and points at the trunk, so moving the stage changes the reading.
+
+**Operating it from the remote.**
+1. Press Button 7. The LCD shows "Set Range: N cm" and the remote sends `rangeSet = 0`, which stops any running hold.
+2. Turn the pot (5–99 cm) and press Button 8 to confirm. The remote sends the value and returns to the telemetry screen.
+3. Line 2 shows `Rng:<range>cm H:<setpoint>` while holding, `Rng:<range>cm FAULT` if the hold stopped itself, and `Range: <range> cm` when it is off. `--` means no echo.
+4. Moving the radial stick cancels the hold; so do the e-stop and a lost radio link. Re-enter the range with Buttons 7 and 8 to resume.
+
+**When the master engages or cancels it (`rangeSetUpdate()`).** The hold reacts to a *change* in `rxPkt.rangeSet`, not to its level:
+- A change to 5–99 cm sets `Target_Range`, clears any fault, and starts the hold.
+- A change to 0 (or any out-of-range value) cancels it and clears the fault.
+- The first packet after a master reboot is only recorded, so a reboot cannot start the stage on a setpoint the remote is still sending.
+- After an e-stop or link loss the remote's value has not changed, so the hold stays off until the operator confirms again.
+
+**Each loop (`radialControl()`).**
+- `radial_spd > 20` → the joystick drives the stepper and the hold is dropped.
+- Otherwise, if the hold is active → `rangeHold()`.
+- Otherwise the stepper is stopped.
+
+**The controller (`rangeHold()`).** The stepper has a single fixed speed, so this is on/off with hysteresis rather than a PID:
+- `error = rangeCm - Target_Range` (positive = too far from the trunk).
+- When stopped, start moving toward the trunk if `error > RANGE_DEADBAND_CM` (2 cm), or away if `error < -2`.
+- When moving, stop as soon as the error reaches or crosses zero. A reversal always passes through a stopped sample first.
+- It acts only on a fresh ultrasonic sample (`rangeNewSample`).
+
+**Faults (`rangeHoldFault()`).** Any of these stops the stage, drops the hold, and sets `rangeFault` (shown on the remote as FAULT until a new range is confirmed or the hold is cancelled):
+- No valid reading for `RANGE_STALE_MS` (300 ms), or `rangeValid` false. The hold never moves blind.
+- During a move, the error grows `RANGE_WRONG_WAY_CM` (3 cm) beyond where it started. This is what a reversed `RADIAL_DIR_TOWARD_TREE` looks like.
+- During a move, the error fails to shrink by `RANGE_PROGRESS_CM` (1 cm) within `RANGE_PROGRESS_MS` (5 s). This catches a stalled motor or the end of the stage's travel, since there are no limit switches.
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `RANGE_SET_MIN_CM` / `RANGE_SET_MAX_CM` | 5 / 99 | Accepted setpoints; must match the remote |
+| `RANGE_DEADBAND_CM` | 2 | Error allowed before the stage moves |
+| `RANGE_STALE_MS` | 300 | Max age of the last valid reading |
+| `RADIAL_DIR_TOWARD_TREE` | `true` | `manualRadialControl()` `dir` that moves toward the trunk. **Verify** |
+| `RANGE_PROGRESS_MS` / `RANGE_PROGRESS_CM` | 5000 / 1 | Stall detection. **Placeholder**, depends on the stage's mm/step |
+| `RANGE_WRONG_WAY_CM` | 3 | Wrong-direction detection |
+
+> ⚠️ **Before using the hold:** jog the stage with the stick and confirm which `radial_dir` moves it toward the trunk, then set `RADIAL_DIR_TOWARD_TREE` to match. Measure the stage speed in cm/s and make sure it covers `RANGE_PROGRESS_CM` well within `RANGE_PROGRESS_MS`; at the current ~39 steps/s a slow lead screw may need a longer window. The progress check is the only thing stopping the stage at the end of its travel.
 
 ---
 
@@ -515,12 +569,12 @@ Nine buttons, each on a digital pin with `INPUT_PULLUP` (reads LOW when pressed)
 ### 7.4 State variables (L38–92)
 
 - **Debounce:** `debounceDelay = 25 ms`; per-button arrays `lastButtonState[8]`, `lastDebounceTime[8]`, `buttonPressed[8]`.
-- **Modes:** `emergencyButtonState`, `setTens` (in "set tension" LCD mode), `setDist` (in "set distance" LCD mode), `conf` (confirmed flag).
+- **Modes:** `emergencyButtonState`, `setTens` (in "set tension" LCD mode), `setDist` (in "set distance" LCD mode); at most one of the two is true. `confirmUntil`/`confirmValue`/`confirmUnit` drive the brief "Confirmed" message.
 - **Joystick raw values:** `leftJoystickxVal`, `leftJoystickyVal`, `rightJoystickxVal`, `rightJoystickyVal`; tunables `deadzone = 160` (raw-count center deadzone, used for both speed and direction) and `joystickDeadzone = 25` (output-side deadzone). Each axis center is sampled at boot.
-- **Potentiometer:** `potVal` (raw 0–1023), `mapPotVal` (mapped value shown/sent), `potCTR` (declared, unused).
+- **Potentiometer:** `mapPotVal` (pot reading in the open screen's units), `potCTR` (declared, unused).
 - **LCD:** `lcd` object at I2C address `0x27`, 16×2.
 - **Radio:** `radio` object, shared `address`, plus an unused `message`/`receivedData` pair left over from testing.
-- **Packet & ack:** `packet` (the outgoing `ControllerPacket`, default shown above) and `ackArr[2]` (the load/range bytes returned by the machine).
+- **Packet & ack:** `packet` (the outgoing `ControllerPacket`, default shown above) and `ackArr[3]` (the load, range, and status bytes returned by the machine; range starts at 255 so the LCD shows "--" until the first ack).
 
 ### 7.5 Function-by-function
 
@@ -528,16 +582,19 @@ Nine buttons, each on a digital pin with `INPUT_PULLUP` (reads LOW when pressed)
 
 **`CheckButtonDebouncePressed(pin, i, name)` (L133–170)** — Standard debounce: if the reading changed, reset that button's timer; once stable longer than `debounceDelay`, update `buttonPressed[i]`. On a *press* (LOW):
 - print the button name,
-- if `i == 2` (Tension Set Point) → toggle `setTens`, clear `conf`,
-- if `i == 6` (Chainsaw Distance Set Point) → toggle `setDist`, clear `conf`,
+- handle the setpoint screens. Only one is open at a time, and its confirm button sends the value and closes it:
+  - `i == 2` (Button 3) → toggle `setTens`, close `setDist`.
+  - `i == 3` (Button 4) while `setTens` → `packet.tensionSet = PotToTension()`, close the screen, show "Confirmed N lb" for 1.5 s.
+  - `i == 6` (Button 7) → toggle `setDist`, close `setTens`. Opening it sets `packet.rangeSet = 0`, which stops the range hold while a new range is chosen.
+  - `i == 7` (Button 8) while `setDist` → `packet.rangeSet = PotToRange()`, close the screen, show "Confirmed N cm" for 1.5 s.
 - set `packet.buttonID = '1' + i` (so index 0→'1', … 7→'8'),
-- `SendPacket()`.
+- `SendPacket()`, so a confirmed value goes out in the same packet as the button event.
 
 **`CheckEmergencyButton()`** — Two-state e-stop:
-- **Normal → emergency:** if the emergency button reads LOW, set `emergencyButtonState = true`, zero every motion speed, and send `b_EMERGENCY = 1`. The LCD warning still flashes, but another emergency packet is sent after each blocking flash delay so a lost first packet cannot leave the master unaware.
+- **Normal → emergency:** if the emergency button reads LOW, set `emergencyButtonState = true`, zero every motion speed and `rangeSet`, close both setpoint screens (Button 8 is held during recovery and must not confirm a range), and send `b_EMERGENCY = 1`. The LCD warning still flashes, but another emergency packet is sent after each blocking flash delay so a lost first packet cannot leave the master unaware.
 - **Emergency → recover:** if both the emergency button **and** Button 8 read LOW, clear `emergencyButtonState`, keep every motion speed at zero, and send `b_EMERGENCY = 0` with `buttonID = '8'`. The master exits only on this cleared emergency state, shows "SYSTEM RECOVERED", and requires Button 1 before automatic tension can run again.
 
-**`ReadJoystick()` (L222–275)** — Reads all four analog joystick axes, then calls `JoystickLeftPWM()` and `JoystickRightPWM()` to convert them into packet fields. The commented block at the bottom is a serial-print map of each direction's meaning.
+**`ReadJoystick()` (L222–275)** — Reads all four analog joystick axes, then calls `JoystickLeftPWM()` and `JoystickRightPWM()` to convert them into packet fields. Any nonzero `radial_spd` sets `packet.rangeSet = 0`, so moving the stage by hand cancels the range hold. The commented block at the bottom is a serial-print map of each direction's meaning.
 
 **`JoystickLeftPWM(joystickxVal, joystickyVal)` (L277–307)** — Converts the **left** joystick. ⚠️ The caller (`ReadJoystick`, L228) invokes it as `JoystickLeftPWM(leftJoystickyVal, leftJoystickxVal)` — **Y is passed into the parameter named `joystickxVal`, and X into `joystickyVal`.** Tracing the *actual* values:
 - The first parameter (`joystickxVal`, which actually holds **left joystick Y**) → `winch_spd` / `winch_dir` (tension).
@@ -549,12 +606,16 @@ Nine buttons, each on a digital pin with `INPUT_PULLUP` (reads LOW when pressed)
 
 **`JoystickRightPWM(joystickxVal, joystickyVal)` (L309–339)** — Converts the **right** joystick, called the same swapped way (`JoystickRightPWM(rightJoystickyVal, rightJoystickxVal)`, L229). By the same tracing: the first parameter (actual **right Y**) → `circum_spd`/`circum_dir`; the second parameter (actual **right X**) → `radial_spd`/`radial_dir`. Physical: **right Y drives circumferential, right X drives radial.**
 
-**`SendPacket()` (L341–373)** — `stopListening()`, `radio.write(&packet, sizeof(packet))`. If sent, print success and, if an ack payload is available, read the 2 bytes back into `ackArr` (the machine's load/range). Else print "Packet Sent Failed!".
+**`SendPacket()` (L341–373)** — `stopListening()`, `radio.write(&packet, sizeof(packet))`. If sent, print success and, if an ack payload is available, read the 3 bytes back into `ackArr` (the machine's load, range, and status bits). Else print "Packet Sent Failed!".
 
-**`LCDScreen()` (L414–483)** — The active LCD renderer (an older version is commented out above it, L375–412). Three display modes:
-- **`setTens` mode:** if button '4' was pressed or already confirmed (`conf`) → show "Confirmed N lbs", latch `packet.tensionSet = mapPotVal`. Otherwise read the pot, `mapPotVal = map(potVal, 0,1023, 10,175)`, show "Set Load: N lbs". The floor is 10 lb, matching the lowest value the master will adopt.
-- **`setDist` mode:** if button '8' or `conf` → "Confirmed N cm". Otherwise read pot, `mapPotVal = map(potVal, 0,1023, 0,99)`, show "Set Range: N cm".
-- **Default (neither):** show live telemetry from the machine — "Load: `ackArr[0]` lbs" (or "255+" if saturated) on line 1, "Range: `ackArr[1]` cm" (or "200+") on line 2.
+**`PotToTension()` / `PotToRange()`** — Read the pot and map it to 10–175 lb or `RANGE_SET_MIN_CM`–`RANGE_SET_MAX_CM` (5–99 cm). The floors match the lowest values the master accepts.
+
+**`ShowConfirm()` / `LCDLine()`** — `ShowConfirm()` arms the 1.5 s "Confirmed" message. `LCDLine()` prints one row padded to 16 characters so text from a previous screen never lingers.
+
+**`LCDScreen()`** — The active LCD renderer (an older version is commented out above it). Three display modes:
+- **`setTens` mode:** "Set Load: N lb" from the live pot, and "Btn 4 = confirm".
+- **`setDist` mode:** "Set Range: N cm" from the live pot, and "Btn 8 = confirm".
+- **Default (neither):** line 1 is "Load: `ackArr[0]` lbs" ("255+" if saturated), or the "Confirmed" message for 1.5 s after a confirm. Line 2 depends on `ackArr[2]`: `Rng:Ncm FAULT`, `Rng:Ncm H:<rangeSet>` while holding, or `Range: N cm`. The range shows "--" for no echo (`255`) and "200+" above 200.
 
 **`loop()`** — Each iteration:
 1. `CheckEmergencyButton()` first. If in emergency, zero all motion commands, transmit another `b_EMERGENCY = 1` packet, and return without processing normal controls.
@@ -602,7 +663,17 @@ So the remote sends a steady stream of joystick packets (buttonID '0') plus extr
 | `connectionTimeout` | `const unsigned long` = 200 | ms with no packet before the link is "lost" |
 | `Target_Weight` | `uint8_t` = 30 | Desired cable tension, **lbs** (the tension setpoint) |
 | `ultra_dur` | `unsigned long` | Ultrasonic echo pulse width, µs |
-| `ultra_dis` | `unsigned long` | Computed distance, cm |
+| `rangeCm` | `uint16_t` | Median-filtered distance to the trunk, cm |
+| `rangeValid` | `bool` | False until the first echo, and after 3 consecutive misses |
+| `rangeNewSample` | `bool` | Set on each valid reading; `rangeHold()` acts only on fresh samples |
+| `lastRangeTime` / `lastPingTime` | `unsigned long` | `millis()` of the last valid reading / last ping |
+| `rangeHistory[3]`, `rangeCount`, `rangeIdx`, `rangeMisses` | — | Median filter history and miss counter |
+| `Target_Range` | `uint8_t` | Active range hold setpoint, cm |
+| `rangeHoldActive` | `bool` | True while the range hold drives the stepper |
+| `rangeFault` | `bool` | Set by `rangeHoldFault()`; cleared when `rangeSet` changes |
+| `rangeSetPrimed` / `lastRangeSet` | `bool` / `uint8_t` | Change detection for `rxPkt.rangeSet`; the first packet after boot only primes it |
+| `radialMotion` | `int8_t` | 1 moving toward the trunk, -1 away, 0 stopped (hold moves only) |
+| `moveStartAbsErr` / `bestAbsErr` / `lastProgressTime` | — | Wrong-direction and stall detection for the current move |
 | `scale` | `HX711` | Load-cell ADC object |
 | `DCTS_EN` | `bool` = 0 | **Auto-tension enable.** True → run `DCTS()`; false → manual winch |
 | `reading` | `long` = 0 | Tare-corrected load-cell value (tension feedback), "quanta" |
@@ -618,7 +689,7 @@ So the remote sends a steady stream of joystick packets (buttonID '0') plus extr
 | `rxPkt` | `ControllerPacket` | The **live** received packet acted on by the machine |
 | `tempPkt` | `ControllerPacket` | Staging packet, validated before copying to `rxPkt` |
 | `radioSent` | `bool` = 0 | True when a packet was recently received (link alive) |
-| `ackArr` | `uint8_t[2]` | Bytes sent back to remote: `[0]`=load(lbs), `[1]`=range(cm) |
+| `ackArr` | `uint8_t[3]` | Bytes sent back to remote: `[0]`=load(lbs), `[1]`=range(cm, 255 = no reading), `[2]`=status (`ACK_RANGE_HOLD` 0x01, `ACK_RANGE_FAULT` 0x02) |
 | `currDIR` | `bool` = 0 | Intended last-direction for traction dampening (largely unused) |
 | `dirCTR` | `uint16_t` = 0 | Direction-change dwell counter (largely unused) |
 | `startTimer` | `unsigned long` | Debug timing (declared) |
@@ -645,9 +716,13 @@ So the remote sends a steady stream of joystick packets (buttonID '0') plus extr
 | `0 … 180` | Circumferential PWM clamp |
 | `0 … 193` | Traction PWM clamp |
 | `194` | `OCRnA` PWM period for Timers 3/4/5 |
-| `200` | `OCR1A` stepper period (Timer 1) |
+| `200` | `OCR1A` stepper period (Timer 1): ~77.7 toggles/s, ~39 steps/s |
 | `0.0343 / 2` | Ultrasonic µs→cm conversion (sound 0.0343 cm/µs, ÷2 round trip) |
-| `30000` | `pulseIn` echo timeout, µs (≈ 5 m max range) |
+| `15000` | `ULTRA_TIMEOUT_US` — `pulseIn` echo timeout, µs (≈ 257 cm max range) |
+| `60` | `ULTRA_PERIOD_MS` — time between pings |
+| `2` / `3` | `ULTRA_MIN_CM` / `ULTRA_MAX_MISSES` — shortest accepted reading; misses before the range is invalid |
+| `5 … 99` | `RANGE_SET_MIN_CM` / `RANGE_SET_MAX_CM` — accepted range hold setpoints; other `rangeSet` values cancel the hold |
+| other `RANGE_*` | Range hold tuning; see the table in [4.5](#45-radial-range-hold) |
 | `10`, `175` | Allowed tension-setpoint range (lbs) when adopting a new `tensionSet` |
 | `0` | `tensionSet` meaning "no confirmed setpoint"; the master ignores it |
 | `2.0` | `TENSION_DEADBAND_LBS` — \|error\| within this (lbs) → PID brakes (L345) |
@@ -674,11 +749,11 @@ So the remote sends a steady stream of joystick packets (buttonID '0') plus extr
 | `Tension_On_Button` | 23 | Button 1 — turn auto-tension ON |
 | `Tension_Off_Button` | 25 | Button 2 — turn auto-tension OFF |
 | `Tension_Set_Point_Button` | 27 | Button 3 — enter "set tension" mode |
-| `Tension_Indicated_Button` | 29 | Button 4 — confirm tension / indicate |
+| `Tension_Indicated_Button` | 29 | Button 4 — confirm tension (in "set tension" mode) |
 | `Chainsaw_On_Button` | 24 | Button 5 — chainsaw ON |
 | `Chainsaw_Off_Button` | 26 | Button 6 — chainsaw OFF |
-| `Chainsaw_Distance_Set_Point_Button` | 28 | Button 7 — enter "set distance" mode |
-| `Chainsaw_Distance_Indicated_Button` | 30 | Button 8 — confirm distance / recover from e-stop |
+| `Chainsaw_Distance_Set_Point_Button` | 28 | Button 7 — enter "set distance" mode (pauses the range hold) |
+| `Chainsaw_Distance_Indicated_Button` | 30 | Button 8 — confirm distance and start the range hold / recover from e-stop |
 | `Emergency_Button` | 22 | Button 9 — emergency stop |
 | `Left_Joystick_Left_Right_X` | A0 | Left joystick X → **traction** (see Issue #9; comments say tension, code wires it to traction) |
 | `Left_Joystick_Up_Down_Y` | A1 | Left joystick Y → **tension/winch** (see Issue #9) |
@@ -701,23 +776,22 @@ So the remote sends a steady stream of joystick packets (buttonID '0') plus extr
 | `emergencyButtonState` | `bool` | True while in emergency lockout |
 | `setTens` | `bool` | True while in "set tension" LCD mode |
 | `setDist` | `bool` | True while in "set distance" LCD mode |
-| `conf` | `bool` | True once a set-point value is confirmed |
+| `confirmUntil` / `confirmValue` / `confirmUnit` | — | The 1.5 s "Confirmed N lb/cm" message after a setpoint is sent |
 | `leftJoystickxVal` | `int` | Raw left-joystick X (0–1023) |
 | `leftJoystickyVal` | `int` | Raw left-joystick Y |
 | `rightJoystickxVal` | `int` | Raw right-joystick X |
 | `rightJoystickyVal` | `int` | Raw right-joystick Y |
 | `deadzone` | `int` = 160 | Raw-count center deadzone; speed stays 0 inside it |
 | `joystickDeadzone` | `int` = 25 | Output-side deadzone (zeroes small speeds) |
-| `potVal` | `uint16_t` = 0 | Raw potentiometer (0–1023) |
-| `mapPotVal` | `uint8_t` = 0 | Mapped pot value (lbs or cm depending on mode) |
+| `mapPotVal` | `uint8_t` = 0 | Mapped pot value shown on the open setpoint screen (lbs or cm) |
 | `potCTR` | `uint16_t` = 0 | Declared, unused |
 | `lcd` | `LiquidCrystal_I2C` | LCD object, address 0x27, 16×2 |
 | `radio` | `RF24` | Radio object (CE 49, CSN 53) |
 | `address` | `const byte[5]` | Shared RF address (must match the machine) |
 | `message` | `const char[]` | Leftover test string, unused in logic |
 | `receivedData` | `char[32]` | Leftover receive buffer, unused |
-| `packet` | `ControllerPacket` | The outgoing packet; default `{'9',0,0,0,0,0,0,0,0,0,0}` (`tensionSet` 0 = unset) |
-| `ackArr[2]` | `uint8_t[]` | Telemetry back from machine: `[0]`=load lbs, `[1]`=range cm |
+| `packet` | `ControllerPacket` | The outgoing packet; default `{'9',0,0,0,0,0,0,0,0,0,0,0}` (`tensionSet`/`rangeSet` 0 = unset) |
+| `ackArr[3]` | `uint8_t[]` | Telemetry back from machine: `[0]`=load lbs, `[1]`=range cm (255 = no reading), `[2]`=status bits |
 
 ### 9.3 Key constants
 
@@ -726,10 +800,11 @@ So the remote sends a steady stream of joystick packets (buttonID '0') plus extr
 | `512` | Joystick center (10-bit ADC midpoint) |
 | `1024` | Joystick range used in `map()` |
 | `193` | Max mapped joystick output (matches motor PWM clamps) |
-| `0 … 175` | "Set Load" pot mapping range (lbs) — v1.1 upper limit |
-| `0 … 99` | "Set Range" pot mapping range (cm) |
-| `255` | LCD "load saturated" sentinel (`ackArr[0]==255` → "255+") |
+| `10 … 175` | "Set Load" pot mapping range (lbs) |
+| `5 … 99` | "Set Range" pot mapping range (cm) — `RANGE_SET_MIN_CM` / `RANGE_SET_MAX_CM`, must match the master |
+| `255` | LCD "load saturated" sentinel (`ackArr[0]==255` → "255+"); also "no reading" for range (`ackArr[1]==255` → "--") |
 | `200` | LCD "range saturated" threshold (`ackArr[1]>200` → "200+") |
+| `1500` | ms the "Confirmed" message stays on line 1 |
 | `0x27` | LCD I2C address |
 
 ---
@@ -744,7 +819,7 @@ These are factual observations from reading the code — **not** changes. Flagge
 
 3. **Stale pin comments (master).** `DT_PIN`/`SCK_PIN` comments say "D2/D3" but the values are 17/18. Several ISR comments say "Winch" where the pin is actually circumferential.
 
-4. **Ultrasonic electrical and trigger timing are explicit.** `Ultrasonic_ECHO` is configured `INPUT`, avoiding output-driver contention with the sensor. `ultraSonic()` generates the sensor's required 2 µs LOW / 10 µs HIGH trigger sequence before reading the echo.
+4. **Ultrasonic electrical and trigger timing are explicit.** `Ultrasonic_ECHO` is configured `INPUT`, avoiding output-driver contention with the sensor. `ultraSonic()` generates the sensor's required 2 µs LOW / 10 µs HIGH trigger sequence before reading the echo. A missed echo is reported as "no reading" (`255`, shown as "--"), not as 0 cm.
 
 5. **`isValid()` is a stub** (master L104–107) — always returns `true`, so no packet validation actually happens despite the staging-buffer pattern in `radioRX()`.
 
@@ -766,11 +841,11 @@ These are factual observations from reading the code — **not** changes. Flagge
 
 12. **The tare-corrected reading validity window is a placeholder.** `RAW_MIN_VALID = -50000L` / `RAW_MAX_VALID = 3000000L` (L347–348) are guessed bounds, not measured load-cell limits. Verify the HX711's actual post-tare minimum and max-load quanta against your calibration; while a reading is out of range, `sensorValid` goes false, the PID brakes, and `measured_lbs` holds its last value.
 
-13. **Winch direction convention is inherited, not re-verified — and one safety path now depends on it.** `driveWinch()` reproduces the old DCTS pin behavior: `Winch_DIR` LOW = the "too loose" branch (L407), HIGH = the "too tight" branch (L409). The test sketch marks this VERIFY-on-bench: which physical motion (spool-in vs spool-out) each pin state produces depends on the motor driver wiring. This is no longer only a cosmetic question, because `winchRelieve()` (L384–387) drives the HIGH branch *on purpose* to escape an over-tension fault — if HIGH actually tightens, the relief would make the fault worse. That is exactly what `OVERTENSION_RELIEF_MS` and `overTensionLatched` bound, but **confirm the direction on the bench before trusting the hard limit.**
+13. **Winch direction convention is inherited, not re-verified — and one safety path now depends on it.** `driveWinch()` reproduces the old DCTS pin behavior: `Winch_DIR` LOW = the "too loose" branch (L407), HIGH = the "too tight" branch (L409). The test sketch marks this VERIFY-on-bench: which physical motion (spool-in vs spool-out) each pin state produces depends on the motor driver wiring. This is no longer only a cosmetic question, because `winchRelieve()` (L384–387) drives the HIGH branch *on purpose* to escape an over-tension fault — if HIGH actually tightens, the relief would make the fault worse. That is exactly what `OVERTENSION_RELIEF_MS` and `overTensionLatched` bound, but **confirm the direction on the bench before trusting the hard limit.** *Partly verified:* manual control tightens with the left stick pushed right. The remaining check is the D29 level while doing that: LOW confirms this convention, HIGH means the PID's two `Winch_DIR` writes and `winchRelieve()` must be swapped (see `WIRING_TABLE.md`).
 
 14. **Vestigial DCTS variables remain.** `TW_Adj` is recomputed on every setpoint change (L846) but is no longer read by any control path, and `PLMI_Adj` (L74) plus `PLMI` (L41) are unused entirely — the PID deadband is `TENSION_DEADBAND_LBS` (lbs). Harmless, but candidates for removal in a cleanup pass.
 
-15. **`ultraSonic()` sits inside the tension feedback path.** In `mainControl()` the ultrasonic ping is fired in the same `scale.is_ready()` block as the load-cell read (L833), *before* `DCTS()` runs. `pulseIn(Ultrasonic_ECHO, HIGH, 30000)` can block for up to 30 ms, so at a ~10 Hz sample rate the reading the PID acts on may already be up to ~30% of a sample period stale, and `dt` picks up the corresponding jitter. Not a correctness bug — `dt` is measured, not assumed — but moving the ping out of the tension path would tighten the loop.
+15. **The range hold rests on three unverified hardware facts.** (a) The ultrasonic sensor must move with the radial stage and face the trunk; if it is fixed to the frame, moving the stage won't change the reading and every move faults on the progress check. (b) `RADIAL_DIR_TOWARD_TREE` is a guess; a wrong value faults after about 3 cm of travel. (c) `RANGE_PROGRESS_MS` assumes the stage covers at least 1 cm in 5 s. There are still **no limit switches**: the progress check is the only end-of-travel protection, and the joystick can drive the stage into either end. `pulseIn()` still blocks the loop for up to 15 ms per ping (every 60 ms); an interrupt on the echo pin (pin 20 is `INT1`) would remove that if it ever matters.
 
 16. **The load-cell slope is written twice.** `QUANTA_PER_LB` (L342) and the bare literal in `ackArr[0] = reading / 10430.0` (L832) are the same calibration constant in two places. If the rig is ever recalibrated, both must change. `ackArr[0]` is also a `uint8_t`, so the reported tension wraps above 255 lbs — only reachable in a fault, given the 175 lb setpoint ceiling, but it means the remote's display can't be trusted to show an over-range condition.
 

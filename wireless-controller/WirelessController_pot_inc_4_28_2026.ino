@@ -48,7 +48,6 @@ bool buttonPressed[8] = { false, false, false, false, false, false, false, false
 bool emergencyButtonState = false;
 bool setTens = false;
 bool setDist = false;
-bool conf = 0;
 // Joysticks Settings
 int leftJoystickxVal;
 int leftJoystickyVal;
@@ -62,8 +61,7 @@ int centerRightX = 512;
 int centerRightY = 512;
 
 // Potentiometer Settings
-uint16_t potVal = 0;  // Potentiometer value
-uint8_t mapPotVal = 0;
+uint8_t mapPotVal = 0;  // Pot reading in the units of the open setpoint screen
 
 // LCD Screen Settings
 LiquidCrystal_I2C lcd(0x27, 16, 2);  // Set the LCD address to 0x27 for 16 chars and 2 line display
@@ -88,12 +86,24 @@ struct ControllerPacket {
   uint8_t radial_spd;  // Right joystick vertical direction data
   bool radial_dir;
   uint8_t tensionSet;
+  uint8_t rangeSet;  // Range hold setpoint in cm, 0 = hold off
 };
 
-ControllerPacket packet = { '9', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };  // tensionSet 0 = no setpoint yet
+ControllerPacket packet = { '9', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };  // tensionSet/rangeSet 0 = no setpoint yet
+
+// Must match the master's RANGE_SET_MIN_CM / RANGE_SET_MAX_CM
+const uint8_t RANGE_SET_MIN_CM = 5;
+const uint8_t RANGE_SET_MAX_CM = 99;
 
 // Initliaze and decalre receiving variables
-uint8_t ackArr[2] = { 0, 0 };
+uint8_t ackArr[3] = { 0, 255, 0 };  // Load lbs, range cm (255 = no reading), status bits
+#define ACK_RANGE_HOLD 0x01
+#define ACK_RANGE_FAULT 0x02
+
+// Brief "Confirmed" message after a setpoint is accepted
+unsigned long confirmUntil = 0;
+uint8_t confirmValue = 0;
+const char* confirmUnit = "";
 
 void ZeroMotionCommands() {
   packet.winch_spd = 0;
@@ -167,13 +177,22 @@ void CheckButtonDebouncePressed(int pin, int i, const char* buttonName) {
         Serial.print(" Pressed: ");
         Serial.println(buttonName);
 
+        // Only one setpoint screen is open at a time. Its confirm button sends the value and closes it.
         if (i == 2) {
           setTens = !setTens;
-          conf = 0;
-        }
-        if (i == 6) {
+          setDist = false;
+        } else if (i == 3 && setTens) {
+          packet.tensionSet = PotToTension();
+          setTens = false;
+          ShowConfirm(packet.tensionSet, " lb");
+        } else if (i == 6) {
           setDist = !setDist;
-          conf = 0;
+          setTens = false;
+          if (setDist) packet.rangeSet = 0;  // Stop the hold while a new range is chosen
+        } else if (i == 7 && setDist) {
+          packet.rangeSet = PotToRange();
+          setDist = false;
+          ShowConfirm(packet.rangeSet, " cm");
         }
 
         packet.buttonID = '1' + i;
@@ -197,6 +216,9 @@ void CheckEmergencyButton() {
       Serial.println("EMERGENCY BUTTON PRESSED - SYSTEM SHUTDOWN!");
 
       ZeroMotionCommands();
+      packet.rangeSet = 0;  // The range hold needs a new confirm after recovery
+      setTens = false;      // Button 8 is held during recovery, it must not confirm a setpoint
+      setDist = false;
       packet.b_EMERGENCY = 1;
       packet.buttonID = '0';
       SendPacket();
@@ -249,6 +271,8 @@ void ReadJoystick() {
 
   JoystickLeftPWM(leftJoystickyVal, leftJoystickxVal);
   JoystickRightPWM(rightJoystickyVal, rightJoystickxVal);
+
+  if (packet.radial_spd > 0) packet.rangeSet = 0;  // Moving the stage by hand cancels the range hold
 
   // Serial.print("Left Joystick X: ");
   // Serial.print(leftJoystickxVal);
@@ -416,75 +440,71 @@ void SendPacket() {
 //   }
 // }
 
+uint8_t PotToTension() {
+  return map(analogRead(Potentiometer), 0, 1023, 10, 175);
+}
+
+uint8_t PotToRange() {
+  return map(analogRead(Potentiometer), 0, 1023, RANGE_SET_MIN_CM, RANGE_SET_MAX_CM);
+}
+
+void ShowConfirm(uint8_t value, const char* unit) {
+  confirmValue = value;
+  confirmUnit = unit;
+  confirmUntil = millis() + 1500;
+}
+
+void LCDLine(uint8_t row, const char* text) {  // Pads to 16 chars so old text never lingers
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%-16s", text);
+  lcd.setCursor(0, row);
+  lcd.print(buf);
+}
+
 void LCDScreen() {
+  char line[17];
+
   if (setTens) {
-    if (packet.buttonID == '4' || conf) {
-      lcd.setCursor(0, 0);
-      lcd.print("Confirmed ");
-      lcd.print(mapPotVal);
-      lcd.print(" lbs");
-      lcd.print("       ");
-      conf = 1;
-      packet.tensionSet = mapPotVal;
-      lcd.setCursor(0, 1);
-      lcd.print("              ");
-    } else {
-      lcd.setCursor(0, 0);
-      potVal = analogRead(Potentiometer);
-      mapPotVal = map(potVal, 0, 1023, 10, 175);
-      lcd.print("Set Load: ");
-      lcd.print(mapPotVal);
-      lcd.print(" lbs");
-      lcd.print(" ");  // Pad spaces
-      lcd.setCursor(0, 1);
-      lcd.print("              ");
-    }
-  } else if (setDist) {
-    if (packet.buttonID == '8' || conf) {
-      lcd.setCursor(0, 0);
-      lcd.print("Confirmed ");
-      lcd.print(mapPotVal);
-      lcd.print(" cm");
-      lcd.print("       ");
-      conf = 1;
-      lcd.setCursor(0, 1);
-      lcd.print("              ");
-    } else {
-      potVal = analogRead(Potentiometer);
-      mapPotVal = map(potVal, 0, 1023, 0, 99);
-
-      lcd.setCursor(0, 0);
-      lcd.print("Set Range: ");
-      lcd.print(mapPotVal);
-      lcd.print(" cm");
-      lcd.print("   ");  // Pad spaces
-      lcd.setCursor(0, 1);
-      lcd.print("              ");
-    }
-  } else {
-    // Update Load if changed
-    lcd.setCursor(0, 0);
-    lcd.print("Load: ");
-    if (ackArr[0] == 255) {
-      lcd.print("255+ lbs ");
-      lcd.print("    ");
-    } else {
-      lcd.print(ackArr[0]);
-      lcd.print(" lbs ");
-      lcd.print("    ");
-    }
-
-
-    // Update Range if changed
-    lcd.setCursor(0, 1);
-    lcd.print("Range: ");
-    if (ackArr[1] > 200) {
-      lcd.print("200+ cm ");
-    } else {
-      lcd.print(ackArr[1]);
-      lcd.print(" cm ");
-    }
+    mapPotVal = PotToTension();
+    snprintf(line, sizeof(line), "Set Load: %u lb", mapPotVal);
+    LCDLine(0, line);
+    LCDLine(1, "Btn 4 = confirm");
+    return;
   }
+  if (setDist) {
+    mapPotVal = PotToRange();
+    snprintf(line, sizeof(line), "Set Range: %u cm", mapPotVal);
+    LCDLine(0, line);
+    LCDLine(1, "Btn 8 = confirm");
+    return;
+  }
+
+  if ((long)(confirmUntil - millis()) > 0) {
+    snprintf(line, sizeof(line), "Confirmed %u%s", confirmValue, confirmUnit);
+  } else if (ackArr[0] == 255) {
+    snprintf(line, sizeof(line), "Load: 255+ lbs");
+  } else {
+    snprintf(line, sizeof(line), "Load: %u lbs", ackArr[0]);
+  }
+  LCDLine(0, line);
+
+  char range[5];
+  if (ackArr[1] == 255) {
+    snprintf(range, sizeof(range), "--");  // No echo, the master is not holding on this
+  } else if (ackArr[1] > 200) {
+    snprintf(range, sizeof(range), "200+");
+  } else {
+    snprintf(range, sizeof(range), "%u", ackArr[1]);
+  }
+
+  if (ackArr[2] & ACK_RANGE_FAULT) {
+    snprintf(line, sizeof(line), "Rng:%scm FAULT", range);
+  } else if (ackArr[2] & ACK_RANGE_HOLD) {
+    snprintf(line, sizeof(line), "Rng:%scm H:%u", range, packet.rangeSet);
+  } else {
+    snprintf(line, sizeof(line), "Range: %s cm", range);
+  }
+  LCDLine(1, line);
 }
 
 void loop() {
