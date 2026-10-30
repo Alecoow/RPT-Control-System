@@ -838,8 +838,11 @@ void mainControl() {  // Manages all movement and calls radio RX function
     if (rxPkt.b_EMERGENCY) {  // If emergency button is pressed at all
       emergency();
     }
-    if (rxPkt.tensionSet != Target_Weight && rxPkt.tensionSet < 176) {  // If a new tension is detected, set it and make sure its between 10 and 175
-      Target_Weight = constrain((uint8_t)rxPkt.tensionSet, 10, 175);
+    // 0 means the remote has not confirmed a setpoint. Compare the value as sent,
+    // never a clamped copy: clamping 1-9 up to 10 made every later packet look new,
+    // so resetPID() ran forever and the winch held its last duty with no over-tension check.
+    if (rxPkt.tensionSet >= 10 && rxPkt.tensionSet <= 175 && rxPkt.tensionSet != Target_Weight) {
+      Target_Weight = rxPkt.tensionSet;
       TW_Adj = Target_Weight * (long)10430;
       resetPID();  // New setpoint, don't carry a stale integrator into it
       // Serial.print("New tension set: ");
@@ -867,6 +870,7 @@ void mainControl() {  // Manages all movement and calls radio RX function
     //   manualRadialControl(((rxPkt.radial_spd > 20)), rxPkt.radial_dir);
     // }
   } else {
+    DCTS_EN = 0;  // Link is down; require Button 1 again before automatic tension resumes
     manualCircumControl(0, 0);
     manualTractControl(0, 0);
     manualTensionControl(0, 0);

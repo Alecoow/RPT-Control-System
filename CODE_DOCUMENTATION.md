@@ -107,11 +107,11 @@ struct ControllerPacket {
 - `traction_spd` / `traction_dir` ← **Left joystick X (horizontal)** → controls the traction (climbing) wheels.
 - `circum_spd` / `circum_dir` ← **Right joystick Y (vertical)** → circumferential motor.
 - `radial_spd` / `radial_dir` ← **Right joystick X (horizontal)** → radial stepper (chainsaw in/out).
-- `tensionSet` ← **potentiometer**, set via the LCD "Set Load" flow. Default value `20`.
+- `tensionSet` ← **potentiometer**, set via the LCD "Set Load" flow. Default value `0`, which means no setpoint has been confirmed.
 
 > ⚠️ **Verify on hardware.** Because the argument order is swapped relative to the `#define` comments, the *physical* axis that moves each motor may not be what the labels suggest. The mapping above is derived strictly from the code's argument order; confirm against the real joysticks.
 
-The remote initializes the packet as `{ '9', 0, 0, 0, 0, 0, 0, 0, 0, 0, 20 }` (remote L89): buttonID `'9'`, no emergency, all speeds/dirs zero, `tensionSet = 20`.
+The remote initializes the packet as `{ '9', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }`: buttonID `'9'`, no emergency, all speeds/dirs zero, `tensionSet = 0`. A reboot therefore cannot change the machine's setpoint until the operator confirms one.
 
 ---
 
@@ -217,11 +217,11 @@ Grouped by purpose (each is fully defined in the [glossary](#8-glossary--master-
 3. If `scale.is_ready()`: read one tare-corrected sample with `scale.get_value(1)`; range-check it against `RAW_MIN_VALID`–`RAW_MAX_VALID`, setting `sensorValid` and, when valid, converting `measured_lbs = reading / QUANTA_PER_LB`; set the PID's fresh-sample latch `newSample = true`, **but only when `DCTS_EN`**, so the latch cannot go stale during manual control; then update the load and range acknowledgements. *(Both ack bytes are refreshed only when the load cell is ready.)*
 4. **If `radioSent` (link is alive):**
    - If `rxPkt.b_EMERGENCY` → `emergency()` (lock down until an explicit clear packet, and disable automatic tension).
-   - If `rxPkt.tensionSet != Target_Weight && rxPkt.tensionSet < 176` → adopt the new setpoint: `Target_Weight = constrain(rxPkt.tensionSet, 10, 175)` (L845) — this is now the PID's setpoint, in lbs — recompute `TW_Adj` (L846; vestigial, the PID no longer reads it), and `resetPID()` (L847) so the old integrator isn't carried into the new setpoint.
+   - If `tensionSet` is between 10 and 175 and differs from `Target_Weight`, adopt it as the PID setpoint in lbs, recompute vestigial `TW_Adj`, and `resetPID()`. Values outside that range, including `0` ("no setpoint"), are ignored. The comparison uses the value as sent, so a rejected reading cannot call `resetPID()` on every pass.
    - **The tension mode switch** (L851–855): if `DCTS_EN` → run `DCTS()` (the PID, auto); else → `manualTensionControl(rxPkt.winch_spd, rxPkt.winch_dir)` (manual).
    - `buttonSel()` — handle the reported button.
    - Manual drive of the other actuators: `manualCircumControl(...)`, `manualTractControl(...)`, `manualRadialControl((rxPkt.radial_spd > 20), rxPkt.radial_dir)` (stepper turns on only past a speed threshold of 20).
-5. **Else (link lost):** zero every motion system, drive `Chainsaw_EN` LOW, and call `resetPID()` so the loop starts clean when the link returns. The cutting tool therefore cannot remain latched on after RF traffic stops.
+5. **Else (link lost):** clear `DCTS_EN`, zero every motion system, drive `Chainsaw_EN` LOW, and call `resetPID()`. Automatic tension does not resume when packets return; the operator must press Button 1. The last confirmed setpoint is kept. The cutting tool cannot remain latched on after RF traffic stops.
 
 **`loop()` (L881–891)** — Calls only `mainControl()`. Everything else (`manualController`, debug, standalone ultrasonic) is commented out. The comment confirms: *"This is the only function that needs to be in here."*
 
@@ -426,7 +426,7 @@ These also set `OCR5B`/`Winch_DIR`:
 
 Both the emergency and link-lost paths also drive `Chainsaw_EN` LOW. Turning the chainsaw on again always requires a new Button 5 command after either safety event.
 
-**They do not simply "win" over the PID — the ownership state matters.** `emergency()` clears `DCTS_EN` before stopping the outputs, so recovery falls through to manual tension control with the zero-speed clear packet rather than automatically restarting the PID. `resetPID()` also clears stale loop state. The operator must deliberately press Button 1 to re-enable automatic tension after recovery. The link-lost branch is the `else` of `if (radioSent)`, so `DCTS()` cannot run in the same iteration.
+**They do not simply "win" over the PID — the ownership state matters.** Both `emergency()` and the link-lost branch clear `DCTS_EN` before stopping the outputs, so neither recovery nor a restored radio link restarts the PID by itself. `resetPID()` also clears stale loop state. The operator must press Button 1 to re-enable automatic tension after either event. The link-lost branch is the `else` of `if (radioSent)`, so `DCTS()` cannot run in the same iteration.
 
 Note: `winchStop()` only clears `OCR5B` (duty 0 = motor off); it leaves `Winch_DIR` at its last value. That is harmless while the duty is zero, but it means the direction pin can sit stale between PID stops.
 
@@ -516,7 +516,7 @@ Nine buttons, each on a digital pin with `INPUT_PULLUP` (reads LOW when pressed)
 
 - **Debounce:** `debounceDelay = 25 ms`; per-button arrays `lastButtonState[8]`, `lastDebounceTime[8]`, `buttonPressed[8]`.
 - **Modes:** `emergencyButtonState`, `setTens` (in "set tension" LCD mode), `setDist` (in "set distance" LCD mode), `conf` (confirmed flag).
-- **Joystick raw values:** `leftJoystickxVal`, `leftJoystickyVal`, `rightJoystickxVal`, `rightJoystickyVal`; tunables `deadzone = 100` (raw-count center deadzone) and `joystickDeadzone = 15` (output-side deadzone).
+- **Joystick raw values:** `leftJoystickxVal`, `leftJoystickyVal`, `rightJoystickxVal`, `rightJoystickyVal`; tunables `deadzone = 160` (raw-count center deadzone, used for both speed and direction) and `joystickDeadzone = 25` (output-side deadzone). Each axis center is sampled at boot.
 - **Potentiometer:** `potVal` (raw 0–1023), `mapPotVal` (mapped value shown/sent), `potCTR` (declared, unused).
 - **LCD:** `lcd` object at I2C address `0x27`, 16×2.
 - **Radio:** `radio` object, shared `address`, plus an unused `message`/`receivedData` pair left over from testing.
@@ -540,8 +540,10 @@ Nine buttons, each on a digital pin with `INPUT_PULLUP` (reads LOW when pressed)
 **`ReadJoystick()` (L222–275)** — Reads all four analog joystick axes, then calls `JoystickLeftPWM()` and `JoystickRightPWM()` to convert them into packet fields. The commented block at the bottom is a serial-print map of each direction's meaning.
 
 **`JoystickLeftPWM(joystickxVal, joystickyVal)` (L277–307)** — Converts the **left** joystick. ⚠️ The caller (`ReadJoystick`, L228) invokes it as `JoystickLeftPWM(leftJoystickyVal, leftJoystickxVal)` — **Y is passed into the parameter named `joystickxVal`, and X into `joystickyVal`.** Tracing the *actual* values:
-- The first parameter (`joystickxVal`, which actually holds **left joystick Y**) → `winch_spd` / `winch_dir` (tension). Distance from center (512) ×2, mapped 0–1024 → 0–193; zeroed if under `joystickDeadzone`.
+- The first parameter (`joystickxVal`, which actually holds **left joystick Y**) → `winch_spd` / `winch_dir` (tension).
 - The second parameter (`joystickyVal`, which actually holds **left joystick X**) → `traction_spd` / `traction_dir`.
+
+  Speed on every axis is 0 until the stick passes `deadzone` counts from its boot-calibrated center, which is also when its direction bit updates. A smaller deflection cannot reuse the previous direction. A center more than 150 counts from 512 is rejected and 512 is used, so the sticks must be released at power-up.
 
   So in physical terms: **left joystick Y drives tension, left joystick X drives traction** — the opposite of what the parameter names and `#define` comments suggest. See [Issue #9](#10-known-issues-quirks-and-things-to-verify).
 
@@ -550,7 +552,7 @@ Nine buttons, each on a digital pin with `INPUT_PULLUP` (reads LOW when pressed)
 **`SendPacket()` (L341–373)** — `stopListening()`, `radio.write(&packet, sizeof(packet))`. If sent, print success and, if an ack payload is available, read the 2 bytes back into `ackArr` (the machine's load/range). Else print "Packet Sent Failed!".
 
 **`LCDScreen()` (L414–483)** — The active LCD renderer (an older version is commented out above it, L375–412). Three display modes:
-- **`setTens` mode:** if button '4' was pressed or already confirmed (`conf`) → show "Confirmed N lbs", latch `packet.tensionSet = mapPotVal`. Otherwise read the pot, `mapPotVal = map(potVal, 0,1023, 0,175)`, show "Set Load: N lbs". *(The 0–175 range is the v1.1 upper limit.)*
+- **`setTens` mode:** if button '4' was pressed or already confirmed (`conf`) → show "Confirmed N lbs", latch `packet.tensionSet = mapPotVal`. Otherwise read the pot, `mapPotVal = map(potVal, 0,1023, 10,175)`, show "Set Load: N lbs". The floor is 10 lb, matching the lowest value the master will adopt.
 - **`setDist` mode:** if button '8' or `conf` → "Confirmed N cm". Otherwise read pot, `mapPotVal = map(potVal, 0,1023, 0,99)`, show "Set Range: N cm".
 - **Default (neither):** show live telemetry from the machine — "Load: `ackArr[0]` lbs" (or "255+" if saturated) on line 1, "Range: `ackArr[1]` cm" (or "200+") on line 2.
 
@@ -647,7 +649,7 @@ So the remote sends a steady stream of joystick packets (buttonID '0') plus extr
 | `0.0343 / 2` | Ultrasonic µs→cm conversion (sound 0.0343 cm/µs, ÷2 round trip) |
 | `30000` | `pulseIn` echo timeout, µs (≈ 5 m max range) |
 | `10`, `175` | Allowed tension-setpoint range (lbs) when adopting a new `tensionSet` |
-| `176` | Upper bound check on incoming `tensionSet` |
+| `0` | `tensionSet` meaning "no confirmed setpoint"; the master ignores it |
 | `2.0` | `TENSION_DEADBAND_LBS` — \|error\| within this (lbs) → PID brakes (L345) |
 | `185.0` | `TENSION_HARD_LIMIT_LBS` — measured tension at/over this (lbs) → PID relieves toward slack, never exceeds (L346) |
 | `-50000 … 3000000` | `RAW_MIN_VALID` / `RAW_MAX_VALID` — tare-corrected reading validity window in quanta (placeholder, verify — see Issue #12) (L347–348) |
@@ -704,8 +706,8 @@ So the remote sends a steady stream of joystick packets (buttonID '0') plus extr
 | `leftJoystickyVal` | `int` | Raw left-joystick Y |
 | `rightJoystickxVal` | `int` | Raw right-joystick X |
 | `rightJoystickyVal` | `int` | Raw right-joystick Y |
-| `deadzone` | `int` = 100 | Raw-count center deadzone for direction decisions |
-| `joystickDeadzone` | `int` = 15 | Output-side deadzone (zeroes small speeds) |
+| `deadzone` | `int` = 160 | Raw-count center deadzone; speed stays 0 inside it |
+| `joystickDeadzone` | `int` = 25 | Output-side deadzone (zeroes small speeds) |
 | `potVal` | `uint16_t` = 0 | Raw potentiometer (0–1023) |
 | `mapPotVal` | `uint8_t` = 0 | Mapped pot value (lbs or cm depending on mode) |
 | `potCTR` | `uint16_t` = 0 | Declared, unused |
@@ -714,7 +716,7 @@ So the remote sends a steady stream of joystick packets (buttonID '0') plus extr
 | `address` | `const byte[5]` | Shared RF address (must match the machine) |
 | `message` | `const char[]` | Leftover test string, unused in logic |
 | `receivedData` | `char[32]` | Leftover receive buffer, unused |
-| `packet` | `ControllerPacket` | The outgoing packet; default `{'9',0,0,0,0,0,0,0,0,0,20}` |
+| `packet` | `ControllerPacket` | The outgoing packet; default `{'9',0,0,0,0,0,0,0,0,0,0}` (`tensionSet` 0 = unset) |
 | `ackArr[2]` | `uint8_t[]` | Telemetry back from machine: `[0]`=load lbs, `[1]`=range cm |
 
 ### 9.3 Key constants
@@ -758,7 +760,7 @@ These are factual observations from reading the code — **not** changes. Flagge
 
    This is the **opposite axis** from what both the parameter names and the `#define` comments (e.g. "Left Joystick X ... For Tension") state. The code's actual behavior is as traced here; the comments are misleading. Confirm against the physical joysticks before relying on any axis label.
 
-10. **`tensionSet` bounds.** `mainControl()` adopts a new setpoint only if `rxPkt.tensionSet != Target_Weight && rxPkt.tensionSet < 176`, then clamps to `[10, 175]`. The remote's pot maps 0–175. So a pot value of 0–9 would be clamped up to 10 on the machine side.
+10. **`tensionSet` is adopted only inside 10–175 lb, and only when that exact value differs from `Target_Weight`.** `0` means the remote has not confirmed a setpoint. The remote pot maps 10–175, so the operator cannot send the out-of-range values that previously retriggered `resetPID()` on every packet.
 
 11. **PID gains are untuned placeholders.** As shipped, `Kp = 1.5` with `Ki = Kd = 0` (L351–353) — the loop is a plain proportional controller with a 2 lb deadband over a 12–30 duty band. Gain units are PWM duty per lb (Kp), per lb·s (Ki), per lb/s (Kd). Tune on the bench, ideally first in the standalone sketch `WinchTensionPID_test_06_19_2026.ino`, which accepts live setpoint changes over Serial; the master file has **no runtime tuning path**, so every gain change there costs a re-flash. When you get to `Ki`, note that the deadband branch returns before the integral is touched, so I has no authority on errors inside ±2 lbs — shrink `TENSION_DEADBAND_LBS` if you need tighter steady-state holding.
 

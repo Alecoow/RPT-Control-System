@@ -10,15 +10,15 @@
 #include "printf.h"
 
 // Defines Buttons
-#define Tension_On_Button 23                   // Left Side Button 1 (Pin 24)
-#define Tension_Off_Button 25                  // Left Side Button 2 (Pin 26)
-#define Tension_Set_Point_Button 27            // Left Side Button 3 (Pin 28)
-#define Tension_Indicated_Button 29            // Left Side Button 4 (Pin 30)
-#define Chainsaw_On_Button 24                  // Right Side Button 5 (Pin 23)
-#define Chainsaw_Off_Button 26                 // Right Side Button 6 (Pin 25)
-#define Chainsaw_Distance_Set_Point_Button 28  // Right Side Button 7 (Pin 27)
-#define Chainsaw_Distance_Indicated_Button 30  // Right Side Button 8 (Pin 29)
-#define Emergency_Button 22                    // Button 9 (Pin 36)
+#define Tension_On_Button 23                   // Left Side Button 1 (Pin 23)
+#define Tension_Off_Button 25                  // Left Side Button 2 (Pin 25)
+#define Tension_Set_Point_Button 27            // Left Side Button 3 (Pin 27)
+#define Tension_Indicated_Button 29            // Left Side Button 4 (Pin 29)
+#define Chainsaw_On_Button 24                  // Right Side Button 5 (Pin 24)
+#define Chainsaw_Off_Button 26                 // Right Side Button 6 (Pin 26)
+#define Chainsaw_Distance_Set_Point_Button 28  // Right Side Button 7 (Pin 28)
+#define Chainsaw_Distance_Indicated_Button 30  // Right Side Button 8 (Pin 30)
+#define Emergency_Button 22                    // Button 9 (Pin 22)
 
 // Define Joysticks
 #define Left_Joystick_Left_Right_X A0   // Left Joystick Horizontal (X) Direction For Tension Loose/Tighten (Pin A0)
@@ -54,8 +54,12 @@ int leftJoystickxVal;
 int leftJoystickyVal;
 int rightJoystickxVal;
 int rightJoystickyVal;
-int deadzone = 100;
-int joystickDeadzone = 15;
+int deadzone = 160;
+int joystickDeadzone = 25;
+int centerLeftX = 512;
+int centerLeftY = 512;
+int centerRightX = 512;
+int centerRightY = 512;
 
 // Potentiometer Settings
 uint16_t potVal = 0;  // Potentiometer value
@@ -86,7 +90,7 @@ struct ControllerPacket {
   uint8_t tensionSet;
 };
 
-ControllerPacket packet = { '9', 0, 0, 0, 0, 0, 0, 0, 0, 0, 20 };
+ControllerPacket packet = { '9', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };  // tensionSet 0 = no setpoint yet
 
 // Initliaze and decalre receiving variables
 uint8_t ackArr[2] = { 0, 0 };
@@ -117,6 +121,12 @@ void setup() {
   pinMode(Right_Joystick_Left_Right_X, INPUT);                // Right Joystick Horizontal (X) Direction
   pinMode(Right_Joystick_Up_Down_Y, INPUT);                   // Right Joystick Vertical (Y) Direction
   pinMode(Potentiometer, INPUT);                              // LCD Screen Joystick
+
+  // Sticks must be released here. A center more than 150 counts from mid-scale is rejected.
+  centerLeftX = CalibrateAxis(Left_Joystick_Left_Right_X);
+  centerLeftY = CalibrateAxis(Left_Joystick_Up_Down_Y);
+  centerRightX = CalibrateAxis(Right_Joystick_Left_Right_X);
+  centerRightY = CalibrateAxis(Right_Joystick_Up_Down_Y);
 
   // Radio Setup Settings
   radio.begin();
@@ -286,68 +296,51 @@ void ReadJoystick() {
   */
 }
 
+int CalibrateAxis(int pin) {
+  long sum = 0;
+  const int samples = 16;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(pin);
+    delay(2);
+  }
+  int center = (int)(sum / samples);
+  if (abs(center - 512) > 150) return 512;  // Held or failed axis; fall back to mid-scale
+  return center;
+}
+
+int AxisSpeed(int value, int center) {
+  int distance = abs(value - center);
+  if (distance <= deadzone) return 0;
+  int output = map(distance - deadzone, 0, 512 - deadzone, 0, 193);
+  if (output > 193) output = 193;
+  if (output < joystickDeadzone) return 0;
+  return output;
+}
+
+// Speed stays 0 until the stick is far enough from center to choose a direction.
+// Otherwise a small deflection reused the previous direction.
+void ApplyAxis(int value, int center, uint8_t& speed, bool& dir) {
+  if (value < center - deadzone) {
+    dir = true;
+    speed = (uint8_t)AxisSpeed(value, center);
+  } else if (value > center + deadzone) {
+    dir = false;
+    speed = (uint8_t)AxisSpeed(value, center);
+  } else {
+    speed = 0;
+  }
+}
+
 void JoystickLeftPWM(int joystickxVal, int joystickyVal) {
-  int distanceFromCenterX = abs(joystickxVal - 512) * 2;
-  int outputValueX = map(distanceFromCenterX, 0, 1024, 0, 193);
-
-  if (outputValueX < joystickDeadzone) {
-    outputValueX = 0;
-  }
-
-  packet.winch_spd = outputValueX;
-
-  if (joystickxVal < (512 - deadzone)) {
-    packet.winch_dir = true;
-  } else if (joystickxVal > (512 + deadzone)) {
-    packet.winch_dir = false;
-  }
-
-  int distanceFromCenterY = abs(joystickyVal - 512) * 2;
-  int outputValueY = map(distanceFromCenterY, 0, 1024, 0, 193);
-
-  if (outputValueY < joystickDeadzone) {
-    outputValueY = 0;
-  }
-
-  if (joystickyVal < (512 - deadzone)) {
-    packet.traction_dir = true;
-  } else if (joystickyVal > (512 + deadzone)) {
-    packet.traction_dir = false;
-  }
-
-  packet.traction_spd = outputValueY;
+  // Caller passes physical Y first (winch) and physical X second (traction).
+  ApplyAxis(joystickxVal, centerLeftY, packet.winch_spd, packet.winch_dir);
+  ApplyAxis(joystickyVal, centerLeftX, packet.traction_spd, packet.traction_dir);
 }
 
 void JoystickRightPWM(int joystickxVal, int joystickyVal) {
-  int distanceFromCenterX = abs(joystickxVal - 512) * 2;
-  int outputValueX = map(distanceFromCenterX, 0, 1024, 0, 193);
-
-  if (outputValueX < joystickDeadzone) {
-    outputValueX = 0;
-  }
-
-  packet.circum_spd = outputValueX;
-
-  if (joystickxVal < (512 - deadzone)) {
-    packet.circum_dir = true;
-  } else if (joystickxVal > (512 + deadzone)) {
-    packet.circum_dir = false;
-  }
-
-  int distanceFromCenterY = abs(joystickyVal - 512) * 2;
-  int outputValueY = map(distanceFromCenterY, 0, 1024, 0, 193);
-
-  if (outputValueY < joystickDeadzone) {
-    outputValueY = 0;
-  }
-
-  packet.radial_spd = outputValueY;
-
-  if (joystickyVal < (512 - deadzone)) {
-    packet.radial_dir = true;
-  } else if (joystickyVal > (512 + deadzone)) {
-    packet.radial_dir = false;
-  }
+  // Caller passes physical Y first (circumferential) and physical X second (radial).
+  ApplyAxis(joystickxVal, centerRightY, packet.circum_spd, packet.circum_dir);
+  ApplyAxis(joystickyVal, centerRightX, packet.radial_spd, packet.radial_dir);
 }
 
 void SendPacket() {
@@ -438,7 +431,7 @@ void LCDScreen() {
     } else {
       lcd.setCursor(0, 0);
       potVal = analogRead(Potentiometer);
-      mapPotVal = map(potVal, 0, 1023, 0, 175);
+      mapPotVal = map(potVal, 0, 1023, 10, 175);
       lcd.print("Set Load: ");
       lcd.print(mapPotVal);
       lcd.print(" lbs");
